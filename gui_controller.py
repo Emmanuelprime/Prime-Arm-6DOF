@@ -11,6 +11,7 @@ import time
 import random
 from raspberry_pi_controller import RobotArmController
 from visualizer_gui import RobotVisualizerWindow
+from path_planning_gui import PathPlanningGUI
 
 
 class RobotArmGUI:
@@ -47,6 +48,9 @@ class RobotArmGUI:
         
         # 3D Visualizer
         self.visualizer = None
+        
+        # Path Planning window
+        self.path_planner_window = None
         
         self.create_widgets()
         
@@ -136,11 +140,16 @@ class RobotArmGUI:
                                  command=self.open_visualizer, state='normal')
         self.viz_btn.grid(row=0, column=2, padx=5)
         
+        # Path Planning button
+        self.path_btn = ttk.Button(button_frame, text="Path Planning", 
+                                   command=self.open_path_planner, state='disabled')
+        self.path_btn.grid(row=0, column=3, padx=5)
+        
         # Smooth motion checkbox
         self.smooth_var = tk.BooleanVar(value=True)
         smooth_check = ttk.Checkbutton(button_frame, text="Smooth Motion (1° steps)", 
                                       variable=self.smooth_var)
-        smooth_check.grid(row=0, column=3, padx=20)
+        smooth_check.grid(row=0, column=4, padx=20)
         
         # Random movement buttons
         random_frame = ttk.LabelFrame(main_frame, text="Random Movement", padding="10")
@@ -280,6 +289,9 @@ class RobotArmGUI:
                 self.move_to_pos_btn.config(state='normal')
                 self.copy_pos_btn.config(state='normal')
                 
+                # Enable path planning button
+                self.path_btn.config(state='normal')
+                
                 # Start update thread
                 self.running = True
                 self.update_thread = threading.Thread(target=self.update_loop, daemon=True)
@@ -308,6 +320,7 @@ class RobotArmGUI:
         self.exec_random_btn.config(state='disabled')
         self.move_to_pos_btn.config(state='disabled')
         self.copy_pos_btn.config(state='disabled')
+        self.path_btn.config(state='disabled')
         self.port_entry.config(state='normal')
         self.update_info("Disconnected")
     
@@ -523,6 +536,24 @@ class RobotArmGUI:
             if self.connected:
                 angles = self.robot.get_current_angles()
                 self.visualizer.update_arm(angles['b'], angles['s'], angles['e'], angles['w'])
+    
+    def open_path_planner(self):
+        """Open path planning window"""
+        if self.path_planner_window is None:
+            # Create new window
+            planner_root = tk.Toplevel(self.root)
+            self.path_planner_window = PathPlanningGUI(planner_root, robot_controller=self.robot)
+            
+            # Handle window close
+            def on_close():
+                self.path_planner_window = None
+                planner_root.destroy()
+            
+            planner_root.protocol("WM_DELETE_WINDOW", on_close)
+            self.update_info("Path Planning window opened")
+        else:
+            # Bring existing window to front
+            messagebox.showinfo("Path Planner", "Path planning window is already open")
     
     def on_closing(self):
         """Handle window closing"""

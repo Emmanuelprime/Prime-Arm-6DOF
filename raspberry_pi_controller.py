@@ -106,29 +106,45 @@ class RobotArmController:
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.write(b'GET\n')
     
-    def _send_raw_command(self, angles_dict):
+    def _send_raw_command(self, angles_dict, debug=False):
         """
         Send raw command to Arduino (internal use)
         
         Args:
             angles_dict: Dictionary with servo angles
+            debug: If True, print the actual command being sent
         """
         if not self.serial_conn or not self.serial_conn.is_open:
             print("Error: Not connected to Arduino")
             return False
         
+        # SAFETY: Clamp all angles to safe ranges as final protection
+        safe_angles = {}
+        for servo, angle in angles_dict.items():
+            if servo == 'g':
+                # Gripper: strict 0-80° limit to prevent motor damage
+                safe_angles[servo] = max(0, min(80, int(angle)))
+            else:
+                # Other servos: 0-180°
+                safe_angles[servo] = max(0, min(180, int(angle)))
+        
         command_parts = []
         for servo in ['b', 's', 'e', 'w', 't', 'g']:
-            if servo in angles_dict:
-                command_parts.append(f"{servo}{angles_dict[servo]}")
+            if servo in safe_angles:
+                command_parts.append(f"{servo}{safe_angles[servo]}")
         
         command = ','.join(command_parts) + '\n'
+        
+        if debug:
+            print(f"  → Sending to Arduino: {command.strip()}")
         
         try:
             self.ack_received.clear()
             self.serial_conn.write(command.encode('utf-8'))
             # Wait for ACK with timeout
-            self.ack_received.wait(timeout=0.1)
+            ack_received = self.ack_received.wait(timeout=0.1)
+            if debug and not ack_received:
+                print(f"  ⚠️  No ACK received for command!")
             return True
         except Exception as e:
             print(f"Error sending command: {e}")
@@ -341,6 +357,216 @@ class RobotArmController:
             print(f"{'='*50}\n")
         
         return success
+    
+    def execute_cartesian_path(self, cartesian_path, dt=0.02, display_progress=True):
+        """
+        Execute a pre-planned Cartesian path with smooth motion
+        
+        Args:
+            cartesian_path: List of (x, y, z) positions
+            dt: Time between steps in seconds (used for step delay)
+            display_progress: Show progress updates
+        
+        Returns:
+            success: Boolean indicating if path was completed
+        """
+        if display_progress:
+            print(f"\n{'='*50}")
+            print(f"Executing Cartesian Path")
+            print(f"Waypoints: {len(cartesian_path)}")
+            print(f"{'='*50}\n")
+        
+        current_angles = self.get_current_angles()
+        initial_guess = {
+            'b': current_angles['b'],
+            's': current_angles['s'],
+            'e': current_angles['e'],
+            'w': current_angles['w']
+        }
+        
+        # Store original step delay
+        original_delay = self.step_delay
+        self.step_delay = dt
+        
+        for i, pos in enumerate(cartesian_path):
+            x, y, z = pos
+            
+            # Solve IK
+            angles, success, error = calculate_ik(x, y, z, initial_guess)
+            
+            if display_progress:
+                print(f"[{i+1}/{len(cartesian_path)}] Moving to ({x:.1f}, {y:.1f}, {z:.1f}) | Error: {error:.3f} cm")
+            
+            # Execute movement with smooth stepping
+            move_command = {
+                'b': angles['b'],
+                's': angles['s'],
+                'e': angles['e'],
+                'w': angles['w'],
+                't': current_angles['t'],
+                'g': current_angles['g']
+            }
+            
+            # Use smooth motion for each waypoint
+            self.send_command(move_command, smooth=True, display_progress=False)
+            
+            # Use this solution as initial guess for next point
+            initial_guess = angles
+        
+        # Restore original step delay
+        self.step_delay = original_delay
+        
+        if display_progress:
+            print(f"\nPath execution complete!")
+            print(f"{'='*50}\n")
+        
+        return True
+    
+    def execute_joint_path(self, joint_path, dt=0.02, display_progress=True):
+        """
+        Execute a pre-planned joint space path with smooth motion
+        
+        Args:
+            joint_path: List of angle dicts [{'b': 0, 's': 0, 'e': 0, 'w': 0}, ...]
+            dt: Time between steps in seconds (used for step delay)
+            display_progress: Show progress updates
+        
+        Returns:
+            success: Boolean indicating if path was completed
+        """
+        if display_progress:
+            print(f"\n{'='*50}")
+            print(f"Executing Joint Path")
+            print(f"Waypoints: {len(joint_path)}")
+            print(f"{'='*50}\n")
+        
+        current_angles = self.get_current_angles()
+        
+        # Store original step delay
+        original_delay = self.step_delay
+        self.step_delay = dt
+        
+        for i, angles in enumerate(joint_path):
+            if display_progress:
+                print(f"[{i+1}/{len(joint_path)}] b={angles['b']:3d}° s={angles['s']:3d}° e={angles['e']:3d}° w={angles['w']:3d}°")
+            
+            move_command = {
+                'b': angles['b'],
+                's': angles['s'],
+                'e': angles['e'],
+                'w': angles['w'],
+                't': current_angles['t'],
+                'g': current_angles['g']
+            }
+            
+            # Use smooth motion for each waypoint
+            self.send_command(move_command, smooth=True, display_progress=False)
+        
+        # Restore original step delay
+        self.step_delay = original_delay
+        
+        if display_progress:
+            print(f"\nPath execution complete!")
+            print(f"{'='*50}\n")
+        
+        return True
+    
+    def execute_pick_and_place(self, pick_and_place_path, dt=0.02, 
+                               gripper_open=0, gripper_close=80, 
+                               display_progress=True):
+        """
+        Execute a pick-and-place path with gripper control
+        
+        Args:
+            pick_and_place_path: List of (x, y, z, gripper_cmd) tuples
+                                gripper_cmd: None, 'open', or 'close'
+            dt: Time between steps in seconds
+            gripper_open: Gripper angle for open position (0-80)
+            gripper_close: Gripper angle for close position (0-80)
+            display_progress: Show progress updates
+        
+        Returns:
+            success: Boolean indicating if operation was completed
+        """
+        # SAFETY: Clamp gripper angles to safe range (0-80°) to prevent motor damage
+        gripper_open = max(0, min(80, int(gripper_open)))
+        gripper_close = max(0, min(80, int(gripper_close)))
+        
+        if display_progress:
+            print(f"\n{'='*50}")
+            print(f"Executing Pick-and-Place Operation")
+            print(f"Total waypoints: {len(pick_and_place_path)}")
+            print(f"Gripper angles: Open={gripper_open}° Close={gripper_close}°")
+            print(f"{'='*50}\n")
+        
+        current_angles = self.get_current_angles()
+        initial_guess = {
+            'b': current_angles['b'],
+            's': current_angles['s'],
+            'e': current_angles['e'],
+            'w': current_angles['w']
+        }
+        
+        # Store original step delay
+        original_delay = self.step_delay
+        self.step_delay = dt
+        
+        for i, waypoint in enumerate(pick_and_place_path):
+            x, y, z, gripper_cmd = waypoint
+            
+            # Solve IK
+            angles, success, error = calculate_ik(x, y, z, initial_guess)
+            
+            # Determine gripper position
+            if gripper_cmd == 'open':
+                gripper_pos = gripper_open
+                action = " [OPEN GRIPPER]"
+            elif gripper_cmd == 'close':
+                gripper_pos = gripper_close
+                action = " [CLOSE GRIPPER]"
+            else:
+                gripper_pos = current_angles['g']
+                action = ""
+            
+            if display_progress:
+                ik_status = "✓" if success else "✗"
+                print(f"[{i+1}/{len(pick_and_place_path)}] ({x:.1f}, {y:.1f}, {z:.1f}){action}")
+                print(f"  {ik_status} IK: b={angles['b']:3d}° s={angles['s']:3d}° e={angles['e']:3d}° w={angles['w']:3d}° | Error: {error:.3f}cm")
+            
+            # Execute movement
+            move_command = {
+                'b': angles['b'],
+                's': angles['s'],
+                'e': angles['e'],
+                'w': angles['w'],
+                't': current_angles['t'],
+                'g': gripper_pos
+            }
+            
+            if display_progress:
+                print(f"  → Command: b={move_command['b']:3d}° s={move_command['s']:3d}° e={move_command['e']:3d}° w={move_command['w']:3d}° t={move_command['t']:3d}° g={move_command['g']:2d}°")
+            
+            # Use smooth motion
+            self.send_command(move_command, smooth=True, display_progress=False)
+            
+            # Extra delay for gripper action
+            if gripper_cmd in ['open', 'close']:
+                time.sleep(0.5)  # Wait for gripper to complete action
+            
+            # Update current gripper position
+            current_angles['g'] = gripper_pos
+            
+            # Use this solution as initial guess for next point
+            initial_guess = angles
+        
+        # Restore original step delay
+        self.step_delay = original_delay
+        
+        if display_progress:
+            print(f"\nPick-and-place operation complete!")
+            print(f"{'='*50}\n")
+        
+        return True
     
     def print_position(self):
         """Print current joint angles and end effector position"""

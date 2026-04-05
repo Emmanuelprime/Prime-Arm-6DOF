@@ -40,34 +40,52 @@ def forward_kinematics(T1, T2, T3, T4):
 
 def inverse_kinematics_numeric(x_target, y_target, z_target, initial_guess=None):
     """Numerical IK solver using Jacobian method with multiple initial guesses."""
-    if initial_guess is None:
-        initial_guesses = [
-            [90, 90, 90, 90],
-            [90, 120, 60, 90],
-            [90, 60, 120, 90],
-            [140, 106, 81, 103],
-            [45, 90, 90, 90],
-            [135, 90, 90, 90],
-        ]
+    # Calculate base angle hint from target X,Y position
+    base_hint = math.degrees(math.atan2(y_target, x_target))
+    if base_hint < 0:
+        base_hint += 360
+    if base_hint > 180:
+        base_hint = 360 - base_hint
+    
+    # Build list of initial guesses
+    initial_guesses = []
+    
+    # If initial guess provided, try it first
+    if initial_guess is not None:
+        initial_guesses.append([
+            math.degrees(initial_guess[0]),
+            math.degrees(initial_guess[1]),
+            math.degrees(initial_guess[2]),
+            math.degrees(initial_guess[3])
+        ])
+    
+    # Add quadrant-specific guess based on target position
+    initial_guesses.append([base_hint, 90, 90, 90])
+    
+    # Add standard guesses
+    initial_guesses.extend([
+        [90, 90, 90, 90],
+        [90, 120, 60, 90],
+        [90, 60, 120, 90],
+        [140, 106, 81, 103],
+        [45, 90, 90, 90],
+        [135, 90, 90, 90],
+    ])
+    
+    best_T = None
+    best_error = float('inf')
+    
+    for guess in initial_guesses:
+        T = np.array([math.radians(g) for g in guess])
+        T_result, final_error = _solve_ik(x_target, y_target, z_target, T)
         
-        best_T = None
-        best_error = float('inf')
-        
-        for guess in initial_guesses:
-            T = np.array([math.radians(g) for g in guess])
-            T_result, final_error = _solve_ik(x_target, y_target, z_target, T)
-            
-            if final_error < best_error:
-                best_error = final_error
-                best_T = T_result
-                if final_error < 0.1:
-                    break
-        
-        return best_T
-    else:
-        T = np.array(initial_guess)
-        T_result, _ = _solve_ik(x_target, y_target, z_target, T)
-        return T_result
+        if final_error < best_error:
+            best_error = final_error
+            best_T = T_result
+            if final_error < 0.1:
+                break
+    
+    return best_T
 
 
 def _solve_ik(x_target, y_target, z_target, T_initial):
@@ -158,7 +176,7 @@ def calculate_ik(x, y, z, initial_servo_angles=None):
     
     return servo_angles, success, error
 if __name__ == "__main__":
-    x, y, z = -0.88, 0.85, 56.47
+    x, y, z = -10, 10, 25
     print(f"\nTarget Position: ({x:.2f}, {y:.2f}, {z:.2f}) cm")
     
     servo_angles, success, error = calculate_ik(x, y, z)
