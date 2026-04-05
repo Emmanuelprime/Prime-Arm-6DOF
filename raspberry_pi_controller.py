@@ -7,6 +7,10 @@ Handles serial communication with Arduino with smooth motion control
 import serial
 import time
 import threading
+import math
+import numpy as np
+from forward_kinematics import forward_kinematics, dh_matrix
+from inverse_kinematics_servo import calculate_ik
 
 
 class RobotArmController:
@@ -27,6 +31,12 @@ class RobotArmController:
         self.feedback_lock = threading.Lock()
         self.listening = False
         self.ack_received = threading.Event()
+        
+        # Forward kinematics parameters (link lengths in cm)
+        self.a1 = 16.4
+        self.a2 = 10.5
+        self.a3 = 14.8
+        self.a4 = 18.0
         
     def connect(self):
         """Establish serial connection with Arduino"""
@@ -224,6 +234,133 @@ class RobotArmController:
             't': 0, 
             'g': 80
         }, smooth=smooth, display_progress=display_progress)
+    
+    def calculate_fk(self, angles=None):
+        """
+        Calculate forward kinematics to get end effector position
+        
+        Args:
+            angles: Dictionary with servo angles {'b': 0, 's': 0, 'e': 0, 'w': 0}
+                   If None, uses current angles
+        
+        Returns:
+            (x, y, z): End effector position in cm
+        """
+        if angles is None:
+            angles = self.get_current_angles()
+        
+        # Convert angles to radians
+        T1 = math.radians(angles['b'])   # Base
+        T2 = math.radians(angles['s'])   # Shoulder
+        T3 = math.radians(angles['e'])   # Elbow
+        T4 = math.radians(angles['w'])   # Wrist
+        
+        # Build DH parameters
+        dh_params = [
+            [T1, math.radians(90), 0, self.a1],
+            [T2, math.radians(180), self.a2, 0],
+            [T3 + math.radians(90), 0, -self.a3, 0],
+            [T4 + math.radians(90), 0, self.a4, 0],
+        ]
+        
+        # Calculate forward kinematics
+        x, y, z = forward_kinematics(dh_params)
+        return x, y, z
+    
+    def get_end_effector_position(self):
+        """
+        Get current end effector position in 3D space
+        
+        Returns:
+            (x, y, z): End effector position in cm
+        """
+        return self.calculate_fk()
+    
+    def move_to_position(self, x, y, z, smooth=True, display_progress=True):
+        """
+        Move end effector to target position using inverse kinematics
+        
+        Args:
+            x, y, z: Target position in cm
+            smooth: If True, moves in 1-degree steps
+            display_progress: If True, displays movement progress
+        
+        Returns:
+            success: Boolean indicating if IK solution was found and executed
+        """
+        if display_progress:
+            print(f"\n{'='*50}")
+            print(f"Moving to position: ({x:.2f}, {y:.2f}, {z:.2f}) cm")
+            print(f"{'='*50}")
+        
+        # Get current angles as initial guess for IK solver
+        current = self.get_current_angles()
+        initial_guess = {
+            'b': current['b'],
+            's': current['s'],
+            'e': current['e'],
+            'w': current['w']
+        }
+        
+        # Solve inverse kinematics
+        servo_angles, success, error = calculate_ik(x, y, z, initial_guess)
+        
+        if display_progress:
+            print(f"\nIK Solution:")
+            print(f"  Base (b):      {servo_angles['b']:3d}°")
+            print(f"  Shoulder (s):  {servo_angles['s']:3d}°")
+            print(f"  Elbow (e):     {servo_angles['e']:3d}°")
+            print(f"  Wrist (w):     {servo_angles['w']:3d}°")
+            print(f"  Position Error: {error:.4f} cm")
+            print(f"  Status: {'SUCCESS' if success else 'FAILED'}")
+        
+        if not success:
+            print(f"\nWARNING: IK solution has high error ({error:.4f} cm)")
+            print(f"Proceeding anyway...\n")
+        
+        # Execute movement (keep twist and gripper at current positions)
+        move_command = {
+            'b': servo_angles['b'],
+            's': servo_angles['s'],
+            'e': servo_angles['e'],
+            'w': servo_angles['w'],
+            't': current['t'],
+            'g': current['g']
+        }
+        
+        result = self.send_command(move_command, smooth=smooth, display_progress=display_progress)
+        
+        if display_progress and result:
+            # Verify final position
+            final_x, final_y, final_z = self.get_end_effector_position()
+            print(f"\nFinal Position Verification:")
+            print(f"  Target:   ({x:7.2f}, {y:7.2f}, {z:7.2f}) cm")
+            print(f"  Achieved: ({final_x:7.2f}, {final_y:7.2f}, {final_z:7.2f}) cm")
+            actual_error = math.sqrt((x-final_x)**2 + (y-final_y)**2 + (z-final_z)**2)
+            print(f"  Error:    {actual_error:7.4f} cm")
+            print(f"{'='*50}\n")
+        
+        return success
+    
+    def print_position(self):
+        """Print current joint angles and end effector position"""
+        angles = self.get_current_angles()
+        x, y, z = self.calculate_fk(angles)
+        
+        print(f"\n{'='*50}")
+        print(f"Joint Angles:")
+        print(f"  Base (b):      {angles['b']:3d}°")
+        print(f"  Shoulder (s):  {angles['s']:3d}°")
+        print(f"  Elbow (e):     {angles['e']:3d}°")
+        print(f"  Wrist (w):     {angles['w']:3d}°")
+        print(f"  Twist (t):     {angles['t']:3d}°")
+        print(f"  Gripper (g):   {angles['g']:3d}°")
+        print(f"\nEnd Effector Position:")
+        print(f"  X: {x:7.2f} cm")
+        print(f"  Y: {y:7.2f} cm")
+        print(f"  Z: {z:7.2f} cm")
+        print(f"{'='*50}\n")
+
 
 
 def main():
