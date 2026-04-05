@@ -1,10 +1,11 @@
 import math
 import numpy as np
 
-T1 = math.radians(0)
-T2 = math.radians(0)
-T3 = math.radians(0)
-T4 = math.radians(0)
+T1 = math.radians(50)
+T2 = math.radians(32)
+T3 = math.radians(8)
+T4 = math.radians(2)
+
 
 a1 = 16.4
 a2 = 10.5
@@ -15,8 +16,8 @@ a4 = 18.0
 DH_PARAMS = [
     [T1,math.radians(90), 0, a1],
     [T2,math.radians(180), a2, 0],
-    [T3 + math.radians(90),math.radians(180), -a3, 0],
-    [T4 + math.radians(90),math.radians(0), -a4, 0],
+    [T3 + math.radians(90),0, -a3, 0],
+    [T4 + math.radians(90),0, a4, 0],
 ]
 
 def dh_matrix(theta, alpha, r, d):

@@ -8,7 +8,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 import time
+import random
 from raspberry_pi_controller import RobotArmController
+from visualizer_gui import RobotVisualizerWindow
 
 
 class RobotArmGUI:
@@ -37,8 +39,14 @@ class RobotArmGUI:
         # Target angles (from sliders)
         self.target_angles = {k: v['current'] for k, v in self.servos.items()}
         
+        # Random angles storage
+        self.random_angles = None
+        
         # Track if we're currently sending commands
         self.sending_command = False
+        
+        # 3D Visualizer
+        self.visualizer = None
         
         self.create_widgets()
         
@@ -112,8 +120,8 @@ class RobotArmGUI:
             row += 1
         
         # Control buttons frame
-        button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=3, column=0, pady=(0, 10))
+        button_frame = ttk.LabelFrame(main_frame, text="Control", padding="10")
+        button_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         
         self.home_btn = ttk.Button(button_frame, text="Home Position", 
                                    command=self.go_home, state='disabled')
@@ -123,15 +131,82 @@ class RobotArmGUI:
                                      command=self.refresh_angles, state='disabled')
         self.refresh_btn.grid(row=0, column=1, padx=5)
         
+        # 3D Visualization button
+        self.viz_btn = ttk.Button(button_frame, text="Open 3D View", 
+                                 command=self.open_visualizer, state='normal')
+        self.viz_btn.grid(row=0, column=2, padx=5)
+        
         # Smooth motion checkbox
         self.smooth_var = tk.BooleanVar(value=True)
         smooth_check = ttk.Checkbutton(button_frame, text="Smooth Motion (1° steps)", 
                                       variable=self.smooth_var)
-        smooth_check.grid(row=0, column=2, padx=20)
+        smooth_check.grid(row=0, column=3, padx=20)
+        
+        # Random movement buttons
+        random_frame = ttk.LabelFrame(main_frame, text="Random Movement", padding="10")
+        random_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        self.gen_random_btn = ttk.Button(random_frame, text="Generate Random Angles", 
+                                        command=self.generate_random_angles, state='disabled')
+        self.gen_random_btn.grid(row=0, column=0, padx=5)
+        
+        self.exec_random_btn = ttk.Button(random_frame, text="Execute Random Angles", 
+                                         command=self.execute_random_angles, state='disabled')
+        self.exec_random_btn.grid(row=0, column=1, padx=5)
+        
+        self.random_angles_label = ttk.Label(random_frame, text="No random angles generated", 
+                                            font=('Arial', 9), foreground="gray")
+        self.random_angles_label.grid(row=0, column=2, padx=20)
+        
+        # Position display frame
+        pos_frame = ttk.LabelFrame(main_frame, text="End Effector Position (cm)", padding="10")
+        pos_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # X, Y, Z labels
+        self.x_label = ttk.Label(pos_frame, text="X: ---", font=('Arial', 11, 'bold'), width=15)
+        self.x_label.grid(row=0, column=0, padx=10)
+        
+        self.y_label = ttk.Label(pos_frame, text="Y: ---", font=('Arial', 11, 'bold'), width=15)
+        self.y_label.grid(row=0, column=1, padx=10)
+        
+        self.z_label = ttk.Label(pos_frame, text="Z: ---", font=('Arial', 11, 'bold'), width=15)
+        self.z_label.grid(row=0, column=2, padx=10)
+        
+        # Inverse Kinematics frame
+        ik_frame = ttk.LabelFrame(main_frame, text="Move to Position (Inverse Kinematics)", padding="10")
+        ik_frame.grid(row=6, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # X input
+        ttk.Label(ik_frame, text="X (cm):").grid(row=0, column=0, padx=5)
+        self.ik_x_entry = ttk.Entry(ik_frame, width=10)
+        self.ik_x_entry.insert(0, "0")
+        self.ik_x_entry.grid(row=0, column=1, padx=5)
+        
+        # Y input
+        ttk.Label(ik_frame, text="Y (cm):").grid(row=0, column=2, padx=5)
+        self.ik_y_entry = ttk.Entry(ik_frame, width=10)
+        self.ik_y_entry.insert(0, "20")
+        self.ik_y_entry.grid(row=0, column=3, padx=5)
+        
+        # Z input
+        ttk.Label(ik_frame, text="Z (cm):").grid(row=0, column=4, padx=5)
+        self.ik_z_entry = ttk.Entry(ik_frame, width=10)
+        self.ik_z_entry.insert(0, "40")
+        self.ik_z_entry.grid(row=0, column=5, padx=5)
+        
+        # Move button
+        self.move_to_pos_btn = ttk.Button(ik_frame, text="Move to Position", 
+                                         command=self.move_to_position, state='disabled')
+        self.move_to_pos_btn.grid(row=0, column=6, padx=10)
+        
+        # Copy current position button
+        self.copy_pos_btn = ttk.Button(ik_frame, text="← Copy Current", 
+                                      command=self.copy_current_position, state='disabled')
+        self.copy_pos_btn.grid(row=0, column=7, padx=5)
         
         # Status bar
         status_bar = ttk.Frame(main_frame, relief=tk.SUNKEN)
-        status_bar.grid(row=4, column=0, sticky=(tk.W, tk.E))
+        status_bar.grid(row=7, column=0, sticky=(tk.W, tk.E))
         
         self.info_label = ttk.Label(status_bar, text="Ready. Please connect to Arduino.", 
                                    font=('Arial', 9))
@@ -160,6 +235,9 @@ class RobotArmGUI:
                 smooth = self.smooth_var.get()
                 self.robot.send_command({servo_id: angle}, smooth=smooth, display_progress=False)
                 self.update_info(f"Moved {self.servos[servo_id]['name']} to {angle}°")
+                
+                # Update 3D visualizer if open
+                self.update_visualizer()
             except Exception as e:
                 self.update_info(f"Error: {e}")
             finally:
@@ -195,6 +273,13 @@ class RobotArmGUI:
                 self.refresh_angles()
                 self.update_info("Connected successfully!")
                 
+                # Enable random movement buttons
+                self.gen_random_btn.config(state='normal')
+                
+                # Enable IK buttons
+                self.move_to_pos_btn.config(state='normal')
+                self.copy_pos_btn.config(state='normal')
+                
                 # Start update thread
                 self.running = True
                 self.update_thread = threading.Thread(target=self.update_loop, daemon=True)
@@ -219,6 +304,10 @@ class RobotArmGUI:
         self.status_label.config(text="● Disconnected", foreground="red")
         self.home_btn.config(state='disabled')
         self.refresh_btn.config(state='disabled')
+        self.gen_random_btn.config(state='disabled')
+        self.exec_random_btn.config(state='disabled')
+        self.move_to_pos_btn.config(state='disabled')
+        self.copy_pos_btn.config(state='disabled')
         self.port_entry.config(state='normal')
         self.update_info("Disconnected")
     
@@ -237,6 +326,9 @@ class RobotArmGUI:
                 home_angles = {'b': 0, 's': 0, 'e': 0, 'w': 0, 't': 0, 'g': 80}
                 for servo_id, angle in home_angles.items():
                     self.root.after(0, lambda s=servo_id, a=angle: self.sliders[s].set(a))
+                
+                # Update 3D visualizer if open
+                self.update_visualizer()
                 
                 self.update_info("Home position reached")
             except Exception as e:
@@ -258,14 +350,129 @@ class RobotArmGUI:
                     self.sliders[servo_id].set(angle)
                     self.angle_labels[servo_id].config(text=f"{angle}°")
             
+            # Update position display
+            x, y, z = self.robot.get_end_effector_position()
+            self.update_position_display(x, y, z)
+            
             self.update_info("Angles refreshed")
         except Exception as e:
             self.update_info(f"Error: {e}")
     
+    def generate_random_angles(self):
+        """Generate random angles for all servos"""
+        if not self.connected:
+            return
+        
+        # Generate random angles within safe ranges
+        self.random_angles = {
+            'b': random.randint(0, 180),
+            's': random.randint(0, 180),
+            'e': random.randint(0, 180),
+            'w': random.randint(0, 180),
+            't': random.randint(0, 180),
+            'g': random.randint(0, 80)
+        }
+        
+        # Update label to show generated angles
+        angles_str = f"b:{self.random_angles['b']}° s:{self.random_angles['s']}° e:{self.random_angles['e']}° w:{self.random_angles['w']}° t:{self.random_angles['t']}° g:{self.random_angles['g']}°"
+        self.random_angles_label.config(text=angles_str, foreground="blue")
+        
+        # Enable execute button
+        self.exec_random_btn.config(state='normal')
+        
+        self.update_info("Random angles generated. Click 'Execute' to move.")
+    
+    def execute_random_angles(self):
+        """Execute the generated random angles"""
+        if not self.connected or self.random_angles is None:
+            return
+        
+        def execute():
+            try:
+                self.update_info("Executing random angles...")
+                smooth = self.smooth_var.get()
+                self.robot.send_command(self.random_angles, smooth=smooth, display_progress=False)
+                
+                # Update sliders to reflect new position
+                for servo_id, angle in self.random_angles.items():
+                    self.root.after(0, lambda s=servo_id, a=angle: self.sliders[s].set(a))
+                
+                # Update 3D visualizer if open
+                self.update_visualizer()
+                
+                self.update_info("Random movement complete!")
+                
+                # Clear random angles after execution
+                self.random_angles = None
+                self.root.after(0, lambda: self.random_angles_label.config(
+                    text="No random angles generated", foreground="gray"))
+                self.root.after(0, lambda: self.exec_random_btn.config(state='disabled'))
+                
+            except Exception as e:
+                self.update_info(f"Error: {e}")
+        
+        threading.Thread(target=execute, daemon=True).start()
+    
+    def move_to_position(self):
+        """Move to position using inverse kinematics"""
+        if not self.connected:
+            return
+        
+        try:
+            x = float(self.ik_x_entry.get())
+            y = float(self.ik_y_entry.get())
+            z = float(self.ik_z_entry.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter valid numeric values for X, Y, Z")
+            return
+        
+        def move():
+            try:
+                self.update_info(f"Moving to position ({x:.2f}, {y:.2f}, {z:.2f})...")
+                smooth = self.smooth_var.get()
+                success = self.robot.move_to_position(x, y, z, smooth=smooth, display_progress=False)
+                
+                if success:
+                    self.update_info(f"Successfully moved to ({x:.2f}, {y:.2f}, {z:.2f})")
+                else:
+                    self.update_info(f"Moved to ({x:.2f}, {y:.2f}, {z:.2f}) with warning (high error)")
+                
+                # Update sliders to match new angles
+                current_angles = self.robot.get_current_angles()
+                for servo_id, angle in current_angles.items():
+                    if servo_id in self.sliders:
+                        self.root.after(0, lambda s=servo_id, a=angle: self.sliders[s].set(a))
+                
+                # Update 3D visualizer if open
+                self.update_visualizer()
+                
+            except Exception as e:
+                self.update_info(f"Error: {e}")
+                messagebox.showerror("Error", f"Failed to move to position: {e}")
+        
+        threading.Thread(target=move, daemon=True).start()
+    
+    def copy_current_position(self):
+        """Copy current end effector position to IK input fields"""
+        if not self.connected:
+            return
+        
+        try:
+            x, y, z = self.robot.get_end_effector_position()
+            self.ik_x_entry.delete(0, tk.END)
+            self.ik_x_entry.insert(0, f"{x:.2f}")
+            self.ik_y_entry.delete(0, tk.END)
+            self.ik_y_entry.insert(0, f"{y:.2f}")
+            self.ik_z_entry.delete(0, tk.END)
+            self.ik_z_entry.insert(0, f"{z:.2f}")
+            self.update_info(f"Copied current position: ({x:.2f}, {y:.2f}, {z:.2f})")
+        except Exception as e:
+            self.update_info(f"Error: {e}")
+    
     def update_loop(self):
-        """Background thread to periodically update angles"""
+        """Background thread to periodically update angles and position"""
         while self.running and self.connected:
-            time.sleep(2)  # Update every 2 seconds
+            time.sleep(0.5)  # Update every 0.5 seconds
             if self.connected and not self.sending_command:
                 try:
                     current_angles = self.robot.get_current_angles()
@@ -274,12 +481,48 @@ class RobotArmGUI:
                         if servo_id in self.angle_labels:
                             self.root.after(0, lambda s=servo_id, a=angle: 
                                           self.angle_labels[s].config(text=f"{a}°"))
+                    
+                    # Update end effector position
+                    x, y, z = self.robot.get_end_effector_position()
+                    self.root.after(0, lambda: self.update_position_display(x, y, z))
+                    
+                    # Update 3D visualizer if open
+                    self.root.after(0, self.update_visualizer)
                 except:
                     pass
+    
+    def update_position_display(self, x, y, z):
+        """Update the position display labels"""
+        self.x_label.config(text=f"X: {x:7.2f}")
+        self.y_label.config(text=f"Y: {y:7.2f}")
+        self.z_label.config(text=f"Z: {z:7.2f}")
     
     def update_info(self, message):
         """Update info label"""
         self.root.after(0, lambda: self.info_label.config(text=message))
+    
+    def open_visualizer(self):
+        """Open 3D visualization window"""
+        if self.visualizer is None or not self.visualizer.is_open:
+            self.visualizer = RobotVisualizerWindow(parent=self.root)
+            # Update with current angles
+            if self.connected:
+                angles = self.robot.get_current_angles()
+            else:
+                angles = {'b': 0, 's': 0, 'e': 0, 'w': 0}
+            self.visualizer.update_arm(angles['b'], angles['s'], angles['e'], angles['w'])
+            self.update_info("3D Visualizer opened")
+        else:
+            # Bring existing window to front
+            self.visualizer.window.lift()
+            self.visualizer.window.focus_force()
+    
+    def update_visualizer(self):
+        """Update 3D visualizer with current angles"""
+        if self.visualizer is not None and self.visualizer.is_open:
+            if self.connected:
+                angles = self.robot.get_current_angles()
+                self.visualizer.update_arm(angles['b'], angles['s'], angles['e'], angles['w'])
     
     def on_closing(self):
         """Handle window closing"""
