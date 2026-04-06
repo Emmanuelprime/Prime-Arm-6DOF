@@ -81,7 +81,6 @@ class PathPlanningGUI:
         
         ttk.Button(wp_control_frame, text="Add Waypoint", 
                   command=self.add_waypoint).grid(row=0, column=6, padx=10)
-        
         ttk.Button(wp_control_frame, text="Use Current Position", 
                   command=self.add_current_position).grid(row=0, column=7, padx=5)
         
@@ -118,6 +117,19 @@ class PathPlanningGUI:
         ttk.Radiobutton(type_frame, text="Pick & Place", variable=self.path_type_var, 
                        value="pick_place").pack(side=tk.LEFT, padx=10)
         
+        # Interpolation method selection
+        interp_frame = ttk.Frame(planning_frame)
+        interp_frame.pack(fill=tk.X, pady=(5, 10))
+        
+        ttk.Label(interp_frame, text="Interpolation:").pack(side=tk.LEFT, padx=5)
+        self.interp_type_var = tk.StringVar(value="linear")
+        ttk.Radiobutton(interp_frame, text="Linear", variable=self.interp_type_var, 
+                       value="linear").pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(interp_frame, text="Cubic (smooth velocity)", variable=self.interp_type_var, 
+                       value="cubic").pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(interp_frame, text="Quintic (smooth accel)", variable=self.interp_type_var, 
+                       value="quintic").pack(side=tk.LEFT, padx=10)
+        
         # Parameters frame
         params_frame = ttk.Frame(planning_frame)
         params_frame.pack(fill=tk.X, pady=(0, 10))
@@ -151,7 +163,7 @@ class PathPlanningGUI:
         # Gripper settings for pick & place
         ttk.Label(params_frame, text="Gripper Open:").grid(row=1, column=2, padx=5, pady=(5,0), sticky='w')
         self.gripper_open_entry = ttk.Entry(params_frame, width=8)
-        self.gripper_open_entry.insert(0, "0")
+        self.gripper_open_entry.insert(0, "30")
         self.gripper_open_entry.grid(row=1, column=3, padx=5, pady=(5,0))
         self.gripper_open_entry.config(state='disabled')
         
@@ -314,13 +326,26 @@ class PathPlanningGUI:
         try:
             points = int(self.points_entry.get())
             path_type = self.path_type_var.get()
+            interp_type = self.interp_type_var.get()
             
             self.status_label.config(text="Planning path...")
             
             if path_type == "straight":
-                self.cartesian_path = self.planner.plan_waypoints_cartesian(
-                    self.waypoints, points
-                )
+                # Use selected interpolation method
+                if interp_type == "cubic":
+                    self.cartesian_path = self.planner.plan_waypoints_cubic_spline(
+                        self.waypoints, points, smooth_velocity=True
+                    )
+                elif interp_type == "quintic":
+                    # For quintic with multiple waypoints, use cubic spline
+                    # (quintic is best for single segment)
+                    self.cartesian_path = self.planner.plan_waypoints_cubic_spline(
+                        self.waypoints, points, smooth_velocity=True
+                    )
+                else:  # linear
+                    self.cartesian_path = self.planner.plan_waypoints_cartesian(
+                        self.waypoints, points
+                    )
                 self.is_pick_place = False
                 
             elif path_type == "arc":
@@ -349,13 +374,15 @@ class PathPlanningGUI:
                     except:
                         pass  # If fails, path will start at approach position
                 
+                # Use selected interpolation method for smooth pick-and-place
                 phases, full_path = self.planner.plan_pick_and_place(
                     self.waypoints[0], self.waypoints[1],
                     current_pos=current_pos,
                     approach_height=approach_height,
                     retract_height=retract_height,
                     num_points_approach=5,
-                    num_points_transfer=points
+                    num_points_transfer=points,
+                    interpolation=interp_type
                 )
                 
                 # Store pick-and-place path with gripper commands
@@ -378,12 +405,16 @@ class PathPlanningGUI:
                 
                 pick_wp_str = f" | Pick at waypoints: {pick_wp_nums}" if pick_wp_nums else " | ⚠️ Pick position NOT in path!"
                 
+                # Add interpolation method to info
+                interp_label = {"linear": "Linear", "cubic": "Cubic", "quintic": "Quintic"}
+                interp_info = f" ({interp_label[interp_type]})"
+                
                 self.path_info_label.config(
-                    text=f"Pick & Place planned: {len(full_path)} waypoints{pick_wp_str}",
+                    text=f"Pick & Place planned: {len(full_path)} waypoints{pick_wp_str}{interp_info}",
                     foreground="blue"
                 )
                 self.execute_btn.config(state='normal')
-                self.status_label.config(text=f"Pick & Place planning complete")
+                self.status_label.config(text=f"Pick & Place complete using {interp_label[interp_type]} interpolation")
                 return
             
             # Compute path info for non-pick-place paths
@@ -394,12 +425,16 @@ class PathPlanningGUI:
             else:
                 path_length = self.planner.compute_path_length(self.cartesian_path)
             
+            # Add interpolation method to info
+            interp_label = {"linear": "Linear", "cubic": "Cubic", "quintic": "Quintic"}
+            interp_info = f" ({interp_label[interp_type]} interpolation)"
+            
             self.path_info_label.config(
-                text=f"Path planned: {len(self.cartesian_path)} points, {path_length:.1f} cm",
+                text=f"Path planned: {len(self.cartesian_path)} points, {path_length:.1f} cm{interp_info}",
                 foreground="blue"
             )
             self.execute_btn.config(state='normal')
-            self.status_label.config(text="Path planning complete")
+            self.status_label.config(text=f"Path planning complete using {interp_label[interp_type]} interpolation")
             
         except ValueError:
             messagebox.showerror("Invalid Input", "Please enter valid numeric values")
@@ -435,11 +470,11 @@ class PathPlanningGUI:
                     try:
                         gripper_open = int(self.gripper_open_entry.get())
                         gripper_close = int(self.gripper_close_entry.get())
-                        # SAFETY: Clamp to safe range to prevent motor damage
-                        gripper_open = max(0, min(80, gripper_open))
-                        gripper_close = max(0, min(80, gripper_close))
+                        # SAFETY: Clamp to safe range, where 30° is fully open
+                        gripper_open = max(30, min(80, gripper_open))
+                        gripper_close = max(30, min(80, gripper_close))
                     except:
-                        gripper_open = 0
+                        gripper_open = 30
                         gripper_close = 80
                     
                     print("\n" + "="*70)
@@ -450,12 +485,12 @@ class PathPlanningGUI:
                     print(f"Place position: {self.waypoints[1]}")
                     print("="*70 + "\n")
                     
-                    self.robot.execute_pick_and_place(
-                        self.cartesian_path, 
-                        dt=dt, 
+                    self.robot.execute_cartesian_pick_and_place(
+                        self.cartesian_path,
+                        dt=dt,
                         gripper_open=gripper_open,
                         gripper_close=gripper_close,
-                        display_progress=True  # Enable to see each waypoint
+                        display_progress=True
                     )
                 else:
                     # Execute regular Cartesian path

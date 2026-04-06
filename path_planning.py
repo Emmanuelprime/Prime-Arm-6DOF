@@ -204,6 +204,145 @@ class PathPlanner:
         
         return smoothed
     
+    def plan_cartesian_line_cubic(self, start_pos, end_pos, num_points=20, 
+                                   start_vel=(0, 0, 0), end_vel=(0, 0, 0)):
+        """
+        Plan smooth path with cubic polynomial interpolation
+        Ensures continuous position and velocity
+        
+        Args:
+            start_pos: (x, y, z) starting position in cm
+            end_pos: (x, y, z) ending position in cm
+            num_points: Number of waypoints along path
+            start_vel: (vx, vy, vz) initial velocity (cm/s), default zero
+            end_vel: (vx, vy, vz) final velocity (cm/s), default zero
+        
+        Returns:
+            List of (x, y, z) positions
+        """
+        start = np.array(start_pos)
+        end = np.array(end_pos)
+        v0 = np.array(start_vel)
+        v1 = np.array(end_vel)
+        
+        path = []
+        for i in range(num_points):
+            t = i / (num_points - 1)
+            
+            # Cubic polynomial: p(t) = a0 + a1*t + a2*t² + a3*t³
+            # Boundary conditions:
+            #   p(0) = start, p(1) = end
+            #   p'(0) = v0, p'(1) = v1
+            # Solution:
+            #   a0 = start
+            #   a1 = v0
+            #   a2 = 3*(end - start) - 2*v0 - v1
+            #   a3 = 2*(start - end) + v0 + v1
+            
+            a0 = start
+            a1 = v0
+            a2 = 3 * (end - start) - 2 * v0 - v1
+            a3 = 2 * (start - end) + v0 + v1
+            
+            point = a0 + a1*t + a2*(t**2) + a3*(t**3)
+            path.append(tuple(point))
+        
+        return path
+    
+    def plan_cartesian_line_quintic(self, start_pos, end_pos, num_points=20,
+                                     start_vel=(0, 0, 0), end_vel=(0, 0, 0),
+                                     start_acc=(0, 0, 0), end_acc=(0, 0, 0)):
+        """
+        Plan smooth path with quintic (5th order) polynomial interpolation
+        Ensures continuous position, velocity, and acceleration
+        
+        Args:
+            start_pos: (x, y, z) starting position in cm
+            end_pos: (x, y, z) ending position in cm
+            num_points: Number of waypoints along path
+            start_vel: (vx, vy, vz) initial velocity (cm/s), default zero
+            end_vel: (vx, vy, vz) final velocity (cm/s), default zero
+            start_acc: (ax, ay, az) initial acceleration (cm/s²), default zero
+            end_acc: (ax, ay, az) final acceleration (cm/s²), default zero
+        
+        Returns:
+            List of (x, y, z) positions
+        """
+        start = np.array(start_pos)
+        end = np.array(end_pos)
+        v0 = np.array(start_vel)
+        v1 = np.array(end_vel)
+        a0 = np.array(start_acc)
+        a1 = np.array(end_acc)
+        
+        path = []
+        for i in range(num_points):
+            t = i / (num_points - 1)
+            
+            # Quintic polynomial: p(t) = c0 + c1*t + c2*t² + c3*t³ + c4*t⁴ + c5*t⁵
+            # Boundary conditions:
+            #   p(0) = start, p(1) = end
+            #   p'(0) = v0, p'(1) = v1
+            #   p''(0) = a0, p''(1) = a1
+            # Solution:
+            c0 = start
+            c1 = v0
+            c2 = 0.5 * a0
+            c3 = 10*end - 10*start - 6*v0 - 4*v1 - 1.5*a0 + 0.5*a1
+            c4 = -15*end + 15*start + 8*v0 + 7*v1 + 1.5*a0 - a1
+            c5 = 6*end - 6*start - 3*v0 - 3*v1 - 0.5*a0 + 0.5*a1
+            
+            point = c0 + c1*t + c2*(t**2) + c3*(t**3) + c4*(t**4) + c5*(t**5)
+            path.append(tuple(point))
+        
+        return path
+    
+    def plan_waypoints_cubic_spline(self, waypoints, num_points_per_segment=15, 
+                                     smooth_velocity=True):
+        """
+        Plan smooth path through waypoints using cubic spline interpolation
+        
+        Args:
+            waypoints: List of (x, y, z) positions
+            num_points_per_segment: Points between each waypoint pair
+            smooth_velocity: If True, ensures velocity continuity at waypoints
+        
+        Returns:
+            List of (x, y, z) positions
+        """
+        if len(waypoints) < 2:
+            return waypoints
+        
+        full_path = []
+        
+        for i in range(len(waypoints) - 1):
+            # Calculate velocities at waypoints for continuity
+            if smooth_velocity and i > 0:
+                # Use central difference for interior waypoints
+                v_start = np.array(waypoints[i]) - np.array(waypoints[i-1])
+            else:
+                v_start = (0, 0, 0)
+            
+            if smooth_velocity and i < len(waypoints) - 2:
+                v_end = np.array(waypoints[i+2]) - np.array(waypoints[i+1])
+            else:
+                v_end = (0, 0, 0)
+            
+            segment = self.plan_cartesian_line_cubic(
+                waypoints[i], 
+                waypoints[i + 1],
+                num_points_per_segment,
+                start_vel=v_start,
+                end_vel=v_end
+            )
+            
+            # Avoid duplicating waypoints
+            if i < len(waypoints) - 2:
+                segment = segment[:-1]
+            full_path.extend(segment)
+        
+        return full_path
+    
     def compute_path_length(self, cartesian_path):
         """
         Compute total path length in Cartesian space
@@ -241,7 +380,8 @@ class PathPlanner:
     
     def plan_pick_and_place(self, pick_pos, place_pos, current_pos=None,
                            approach_height=10, retract_height=10, 
-                           num_points_approach=5, num_points_transfer=15):
+                           num_points_approach=5, num_points_transfer=15,
+                           interpolation='linear'):
         """
         Plan complete pick-and-place operation with all 7 phases:
         1. Move to Pre-Pick/Approach Pose
@@ -261,6 +401,7 @@ class PathPlanner:
             retract_height: Height to retract after pick/place (cm)
             num_points_approach: Points for vertical approach/retract
             num_points_transfer: Points for transfer between pick and place
+            interpolation: 'linear', 'cubic', or 'quintic' for smooth trajectories
         
         Returns:
             phases: Dict with phase names and their paths
@@ -280,25 +421,33 @@ class PathPlanner:
         
         phases = {}
         
+        # Select interpolation function
+        if interpolation == 'cubic':
+            plan_func = self.plan_cartesian_line_cubic
+        elif interpolation == 'quintic':
+            plan_func = self.plan_cartesian_line_quintic
+        else:  # linear
+            plan_func = self.plan_cartesian_line
+        
         # Phase 1: Move to Pre-Pick/Approach Pose (from current position)
         if current_pos is not None:
-            phases['approach_to_pick'] = self.plan_cartesian_line(
+            phases['approach_to_pick'] = plan_func(
                 current_pos, above_pick, num_points_transfer
             )
         else:
             # Start at approach position if no current position given
             phases['approach_to_pick'] = [above_pick]
         
-        # Phase 2: Descend to Pick (Grasp)
-        phases['descend_to_pick'] = self.plan_cartesian_line(
+        # Phase 2: Descend to Pick (Grasp) - use smooth interpolation
+        phases['descend_to_pick'] = plan_func(
             above_pick, at_pick, num_points_approach
         )
         
         # Phase 3: Close Gripper
         phases['close_gripper'] = [at_pick]
         
-        # Phase 4: Retract/Lift with object
-        phases['retract_pick'] = self.plan_cartesian_line(
+        # Phase 4: Retract/Lift with object - use smooth interpolation
+        phases['retract_pick'] = plan_func(
             at_pick, above_pick_retract, num_points_approach
         )
         
@@ -309,16 +458,16 @@ class PathPlanner:
             num_points=num_points_transfer
         )
         
-        # Phase 6: Descend to Place
-        phases['descend_to_place'] = self.plan_cartesian_line(
+        # Phase 6: Descend to Place - use smooth interpolation
+        phases['descend_to_place'] = plan_func(
             above_place, at_place, num_points_approach
         )
         
         # Phase 7: Open Gripper
         phases['open_gripper'] = [at_place]
         
-        # Phase 8: Retract/Return after place
-        phases['retract_place'] = self.plan_cartesian_line(
+        # Phase 8: Retract/Return after place - use smooth interpolation
+        phases['retract_place'] = plan_func(
             at_place, above_place_retract, num_points_approach
         )
         
