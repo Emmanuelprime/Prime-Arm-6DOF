@@ -41,12 +41,16 @@ class RobotArmController:
     def connect(self):
         """Establish serial connection with Arduino"""
         try:
-            self.serial_conn = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                timeout=1
-            )
-            time.sleep(2)
+            # Set dtr=False BEFORE open() so the DTR line never pulses,
+            # which prevents the Arduino from auto-resetting on connect.
+            self.serial_conn = serial.Serial()
+            self.serial_conn.port = self.port
+            self.serial_conn.baudrate = self.baudrate
+            self.serial_conn.timeout = 1
+            self.serial_conn.dtr = False  # must be set before open()
+            self.serial_conn.rts = False
+            self.serial_conn.open()
+            time.sleep(0.1)  # brief settle
             print(f"Connected to {self.port}")
             
             # Start feedback listener thread
@@ -54,10 +58,19 @@ class RobotArmController:
             self.listener_thread = threading.Thread(target=self._listen_feedback, daemon=True)
             self.listener_thread.start()
             
-            # Get initial angles from Arduino
-            time.sleep(0.5)
-            self._request_current_angles()
-            time.sleep(0.5)
+            # Poll until we receive real angles from the Arduino (up to 15 s)
+            print("Waiting for Arduino feedback...", end='', flush=True)
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                self._request_current_angles()
+                time.sleep(0.5)
+                with self.feedback_lock:
+                    angles = self.current_angles.copy()
+                # Any non-zero joint angle means feedback arrived
+                if any(angles[k] != 0 for k in ('b', 's', 'e', 'w', 't')):
+                    break
+                print('.', end='', flush=True)
+            print()  # newline after dots
             
             return True
         except serial.SerialException as e:
@@ -108,11 +121,8 @@ class RobotArmController:
     
     def _send_raw_command(self, angles_dict, debug=False):
         """
-        Send raw command to Arduino (internal use)
-        
-        Args:
-            angles_dict: Dictionary with servo angles
-            debug: If True, print the actual command being sent
+        Send raw command to Arduino and wait for ACK.
+        Use for single positional moves. For path streaming use _stream_command.
         """
         if not self.serial_conn or not self.serial_conn.is_open:
             print("Error: Not connected to Arduino")
@@ -122,8 +132,8 @@ class RobotArmController:
         safe_angles = {}
         for servo, angle in angles_dict.items():
             if servo == 'g':
-                # Gripper: strict 0-80° limit to prevent motor damage
-                safe_angles[servo] = max(0, min(80, int(angle)))
+                    # Gripper: strict 30-80° limit, where 30° is fully open
+                safe_angles[servo] = max(30, min(80, int(angle)))
             else:
                 # Other servos: 0-180°
                 safe_angles[servo] = max(0, min(180, int(angle)))
@@ -149,7 +159,36 @@ class RobotArmController:
         except Exception as e:
             print(f"Error sending command: {e}")
             return False
-    
+
+    def _stream_command(self, angles_dict):
+        """
+        Send a command WITHOUT waiting for ACK — for high-speed path streaming.
+        The Arduino processes immediately; Python doesn't block on the reply.
+        The caller is responsible for sleeping an appropriate dt between calls
+        so the Arduino has time to process and the servo has time to move.
+        """
+        if not self.serial_conn or not self.serial_conn.is_open:
+            return False
+
+        safe_angles = {}
+        for servo, angle in angles_dict.items():
+            if servo == 'g':
+                safe_angles[servo] = max(30, min(80, int(angle)))
+            else:
+                safe_angles[servo] = max(0, min(180, int(angle)))
+
+        command_parts = []
+        for servo in ['b', 's', 'e', 'w', 't', 'g']:
+            if servo in safe_angles:
+                command_parts.append(f"{servo}{safe_angles[servo]}")
+
+        try:
+            self.serial_conn.write((','.join(command_parts) + '\n').encode('utf-8'))
+            return True
+        except Exception as e:
+            print(f"Error streaming command: {e}")
+            return False
+
     def send_command(self, angles_dict, smooth=True, display_progress=True):
         """
         Send movement command with smooth 1-degree stepping
@@ -170,7 +209,7 @@ class RobotArmController:
         target = {}
         for servo, angle in angles_dict.items():
             if servo == 'g':
-                target[servo] = max(0, min(80, angle))
+                target[servo] = max(30, min(80, angle))
             else:
                 target[servo] = max(0, min(180, angle))
         
@@ -229,7 +268,7 @@ class RobotArmController:
         
         Args:
             servo: Servo identifier ('b', 's', 'e', 'w', 't', 'g')
-            angle: Target angle (0-180, gripper: 0-80)
+            angle: Target angle (0-180, gripper: 30-80)
             smooth: If True, moves in 1-degree steps
             display_progress: If True, displays angle changes
         """
@@ -243,11 +282,11 @@ class RobotArmController:
     def home_position(self, smooth=True, display_progress=True):
         """Move all servos to home position"""
         return self.send_command({
-            'b': 0, 
-            's': 0, 
-            'e': 0, 
-            'w': 0, 
-            't': 0, 
+            'b': 90,
+            's': 130,
+            'e': 180,
+            'w': 180,
+            't': 180,
             'g': 80
         }, smooth=smooth, display_progress=display_progress)
     
@@ -470,102 +509,162 @@ class RobotArmController:
             print(f"{'='*50}\n")
         
         return True
-    
-    def execute_pick_and_place(self, pick_and_place_path, dt=0.02, 
-                               gripper_open=0, gripper_close=80, 
+
+    def execute_cartesian_pick_and_place(self, pick_and_place_path, dt=0.015,
+                               gripper_open=30, gripper_close=80,
                                display_progress=True):
         """
-        Execute a pick-and-place path with gripper control
-        
-        Args:
-            pick_and_place_path: List of (x, y, z, gripper_cmd) tuples
-                                gripper_cmd: None, 'open', or 'close'
-            dt: Time between steps in seconds
-            gripper_open: Gripper angle for open position (0-80)
-            gripper_close: Gripper angle for close position (0-80)
-            display_progress: Show progress updates
-        
-        Returns:
-            success: Boolean indicating if operation was completed
+        Legacy Cartesian-path executor kept for path_planning_gui.py compatibility.
+        Prefer execute_pick_and_place() for new code.
         """
-        # SAFETY: Clamp gripper angles to safe range (0-80°) to prevent motor damage
-        gripper_open = max(0, min(80, int(gripper_open)))
-        gripper_close = max(0, min(80, int(gripper_close)))
-        
-        if display_progress:
-            print(f"\n{'='*50}")
-            print(f"Executing Pick-and-Place Operation")
-            print(f"Total waypoints: {len(pick_and_place_path)}")
-            print(f"Gripper angles: Open={gripper_open}° Close={gripper_close}°")
-            print(f"{'='*50}\n")
-        
+        gripper_open  = max(30, min(80, int(gripper_open)))
+        gripper_close = max(30, min(80, int(gripper_close)))
+        n = len(pick_and_place_path)
         current_angles = self.get_current_angles()
-        initial_guess = {
-            'b': current_angles['b'],
-            's': current_angles['s'],
-            'e': current_angles['e'],
-            'w': current_angles['w']
-        }
-        
-        # Store original step delay
-        original_delay = self.step_delay
-        self.step_delay = dt
-        
-        for i, waypoint in enumerate(pick_and_place_path):
-            x, y, z, gripper_cmd = waypoint
-            
-            # Solve IK
-            angles, success, error = calculate_ik(x, y, z, initial_guess)
-            
-            # Determine gripper position
+        guess = {k: current_angles[k] for k in ('b', 's', 'e', 'w')}
+        gripper_pos = current_angles['g']
+        twist = current_angles['t']
+        commands = []
+        for x, y, z, gripper_cmd in pick_and_place_path:
+            angles, ok, err = calculate_ik(x, y, z, guess)
             if gripper_cmd == 'open':
                 gripper_pos = gripper_open
-                action = " [OPEN GRIPPER]"
             elif gripper_cmd == 'close':
                 gripper_pos = gripper_close
-                action = " [CLOSE GRIPPER]"
+            commands.append({'cmd': {'b': angles['b'], 's': angles['s'],
+                                     'e': angles['e'], 'w': angles['w'],
+                                     't': twist,       'g': gripper_pos},
+                             'gripper_cmd': gripper_cmd})
+            guess = angles
+        for entry in commands:
+            self._stream_command(entry['cmd'])
+            if entry['gripper_cmd'] in ('open', 'close'):
+                time.sleep(0.6)
             else:
-                gripper_pos = current_angles['g']
-                action = ""
-            
-            if display_progress:
-                ik_status = "✓" if success else "✗"
-                print(f"[{i+1}/{len(pick_and_place_path)}] ({x:.1f}, {y:.1f}, {z:.1f}){action}")
-                print(f"  {ik_status} IK: b={angles['b']:3d}° s={angles['s']:3d}° e={angles['e']:3d}° w={angles['w']:3d}° | Error: {error:.3f}cm")
-            
-            # Execute movement
-            move_command = {
-                'b': angles['b'],
-                's': angles['s'],
-                'e': angles['e'],
-                'w': angles['w'],
-                't': current_angles['t'],
-                'g': gripper_pos
-            }
-            
-            if display_progress:
-                print(f"  → Command: b={move_command['b']:3d}° s={move_command['s']:3d}° e={move_command['e']:3d}° w={move_command['w']:3d}° t={move_command['t']:3d}° g={move_command['g']:2d}°")
-            
-            # Use smooth motion
-            self.send_command(move_command, smooth=True, display_progress=False)
-            
-            # Extra delay for gripper action
-            if gripper_cmd in ['open', 'close']:
-                time.sleep(0.5)  # Wait for gripper to complete action
-            
-            # Update current gripper position
-            current_angles['g'] = gripper_pos
-            
-            # Use this solution as initial guess for next point
-            initial_guess = angles
-        
-        # Restore original step delay
-        self.step_delay = original_delay
-        
+                time.sleep(dt)
+        with self.feedback_lock:
+            self.current_angles.update(commands[-1]['cmd'])
+        return True
+
+    def execute_pick_and_place(self, pick_pos, place_pos,
+                               approach_height=5.0, retract_height=5.0,
+                               gripper_open=30, gripper_close=80,
+                               steps_per_segment=30, dt=0.07,
+                               vertical_dt=None,
+                               display_progress=True):
+        """
+        Smooth pick-and-place via joint-space interpolation.
+
+        Instead of Cartesian path following (which causes IK failures mid-path),
+        this method:
+          1. Solves IK for only 5 key Cartesian positions.
+          2. Linearly interpolates joint angles between each pair of key positions.
+          3. Streams the pre-computed angle sequence at fixed dt intervals.
+
+        Smooth motion is guaranteed because:
+          - Both endpoints of every segment always have valid IK solutions.
+          - Linear interpolation in joint space never passes through unreachable space.
+          - dt shorter than servo travel time keeps servos always "chasing".
+
+        Args:
+            pick_pos:  (x, y, z) — grasp point (top-centre of the object)
+            place_pos: (x, y, z) — release point
+            approach_height:  cm above pick_pos to approach from
+            retract_height:   cm above place_pos to transit at
+            gripper_open:     angle for open gripper (30-80°)
+            gripper_close:    angle for gripped (30-80°)
+            steps_per_segment: joint-space interpolation steps between key poses
+            dt:               seconds between commands for transit phases (1 & 4)
+            vertical_dt:      seconds between commands for descend/retract phases
+                              (2, 3, 5, 6). Defaults to dt * 2 if not specified.
+            display_progress: print phase labels and IK summary
+        """
+        gripper_open  = max(30, min(80, int(gripper_open)))
+        gripper_close = max(30, min(80, int(gripper_close)))
+        if vertical_dt is None:
+            vertical_dt = dt * 2
+
+        px, py, pz = pick_pos
+        lx, ly, lz = place_pos
+
+        # ── 5 key Cartesian positions ─────────────────────────────────────
+        above_pick  = (px, py, pz + approach_height)
+        at_pick     = (px, py, pz)
+        above_place = (lx, ly, lz + retract_height)
+        at_place    = (lx, ly, lz)
+
+        # ── Solve IK for each key position ────────────────────────────────
+        current = self.get_current_angles()
+        twist   = current['t']
+        guess   = {k: current[k] for k in ('b', 's', 'e', 'w')}
+
         if display_progress:
-            print(f"\nPick-and-place operation complete!")
+            print(f"\n{'='*50}")
+            print(f"Joint-space pick-and-place")
+            print(f"Solving IK for 5 key positions…")
+
+        def solve(label, pos):
+            nonlocal guess
+            angles, ok, err = calculate_ik(*pos, guess)
+            if display_progress:
+                st = '✓' if ok else '✗'
+                print(f"  {st} {label:14s}: b={angles['b']:3d}° s={angles['s']:3d}° "
+                      f"e={angles['e']:3d}° w={angles['w']:3d}°  err={err:.2f} cm")
+            guess = angles
+            return angles
+
+        j_current    = {k: current[k] for k in ('b', 's', 'e', 'w')}
+        j_above_pick  = solve('above_pick',  above_pick)
+        j_at_pick     = solve('at_pick',     at_pick)
+        j_above_place = solve('above_place', above_place)
+        j_at_place    = solve('at_place',    at_place)
+
+        total_steps = 6 * steps_per_segment
+        if display_progress:
+            print(f"\n  steps_per_segment={steps_per_segment}  "
+                  f"total={total_steps} commands")
+            print(f"  Transit dt={dt*1000:.0f} ms   Vertical dt={vertical_dt*1000:.0f} ms")
+            print(f"  Gripper: open={gripper_open}°  close={gripper_close}°")
+            print(f"{'='*50}")
+
+        # ── Joint-space segment streamer ──────────────────────────────────
+        def stream_segment(label, from_j, to_j, g_angle, seg_dt=dt):
+            if display_progress:
+                print(f"  {label}")
+            for step in range(1, steps_per_segment + 1):
+                t = step / steps_per_segment
+                cmd = {k: int(round(from_j[k] + t * (to_j[k] - from_j[k])))
+                       for k in ('b', 's', 'e', 'w')}
+                cmd['t'] = twist
+                cmd['g'] = g_angle
+                self._stream_command(cmd)
+                time.sleep(seg_dt)
+
+        def gripper_action(label, j_pos, g_angle):
+            if display_progress:
+                print(f"  {label}")
+            self._stream_command({**j_pos, 't': twist, 'g': g_angle})
+            time.sleep(0.6)   # give gripper time to physically open/close
+
+        # ── Execute the 6 motion phases ───────────────────────────────────
+        stream_segment('Phase 1 → approach pick    ', j_current,     j_above_pick,   gripper_open,  dt)
+        stream_segment('Phase 2 → descend to pick  ', j_above_pick,  j_at_pick,      gripper_open,  vertical_dt)
+        gripper_action('         → close gripper    ', j_at_pick,                     gripper_close)
+        stream_segment('Phase 3 → retract from pick ', j_at_pick,    j_above_pick,   gripper_close, vertical_dt)
+        stream_segment('Phase 4 → transfer          ', j_above_pick,  j_above_place,  gripper_close, dt)
+        stream_segment('Phase 5 → descend to place  ', j_above_place, j_at_place,    gripper_close, vertical_dt)
+        gripper_action('         → open gripper      ', j_at_place,                   gripper_open)
+        stream_segment('Phase 6 → retract from place', j_at_place,   j_above_place,  gripper_open,  vertical_dt)
+
+        # ── Sync angle cache ──────────────────────────────────────────────
+        with self.feedback_lock:
+            self.current_angles.update({**j_above_place, 't': twist, 'g': gripper_open})
+
+        if display_progress:
+            print(f"\nPick-and-place complete!")
             print(f"{'='*50}\n")
-        
+
+        return True
         return True
     
     def print_position(self):

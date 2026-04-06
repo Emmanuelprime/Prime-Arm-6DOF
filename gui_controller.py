@@ -10,7 +10,11 @@ import threading
 import time
 import random
 from raspberry_pi_controller import RobotArmController
-from visualizer_gui import RobotVisualizerWindow
+try:
+    from visualizer_gui import RobotVisualizerWindow
+    VISUALIZER_AVAILABLE = True
+except ImportError:
+    VISUALIZER_AVAILABLE = False
 from path_planning_gui import PathPlanningGUI
 
 
@@ -34,7 +38,7 @@ class RobotArmGUI:
             'e': {'name': 'Elbow', 'min': 0, 'max': 180, 'current': 0},
             'w': {'name': 'Wrist', 'min': 0, 'max': 180, 'current': 0},
             't': {'name': 'Twist', 'min': 0, 'max': 180, 'current': 0},
-            'g': {'name': 'Gripper', 'min': 0, 'max': 80, 'current': 80}
+            'g': {'name': 'Gripper', 'min': 30, 'max': 80, 'current': 80}
         }
         
         # Target angles (from sliders)
@@ -336,7 +340,7 @@ class RobotArmGUI:
                 self.robot.home_position(smooth=smooth, display_progress=False)
                 
                 # Update sliders to home position
-                home_angles = {'b': 0, 's': 0, 'e': 0, 'w': 0, 't': 0, 'g': 80}
+                home_angles = {'b': 90, 's': 130, 'e': 180, 'w': 180, 't': 180, 'g': 80}
                 for servo_id, angle in home_angles.items():
                     self.root.after(0, lambda s=servo_id, a=angle: self.sliders[s].set(a))
                 
@@ -516,6 +520,9 @@ class RobotArmGUI:
     
     def open_visualizer(self):
         """Open 3D visualization window"""
+        if not VISUALIZER_AVAILABLE:
+            messagebox.showinfo("Not Available", "3D Visualizer module (visualizer_gui) is not installed.")
+            return
         if self.visualizer is None or not self.visualizer.is_open:
             self.visualizer = RobotVisualizerWindow(parent=self.root)
             # Update with current angles

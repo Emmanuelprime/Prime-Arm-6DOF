@@ -1,4 +1,5 @@
 #include <Servo.h>
+#include <EEPROM.h>
 
 #define GRIPPER_PIN 11   
 #define TWIST_PIN 10  
@@ -11,13 +12,24 @@ Servo gripper, twist, wrist, elbow, shoulder, base;
 
 const int MIN_ANGLE = 0;
 const int MAX_ANGLE = 180;
-const int GRIPPER_MIN = 0; // open
+const int GRIPPER_MIN = 30; // open
 const int GRIPPER_MAX = 80; // close
 
-int currentAngles[6] = {0, 0, 0, 0, 0, 80};  // b, s, e, w, t, g
+// EEPROM layout: 6 angle bytes at addresses 0-5, magic byte at address 6
+#define EEPROM_BASE_ADDR  0
+#define EEPROM_MAGIC_ADDR 6
+#define EEPROM_MAGIC_VAL  0xAB
+
+// Safe neutral start position (where arm typically rests when unpowered)
+int currentAngles[6] = {0, 0, 0, 0, 0, 80};   // b, s, e, w, t, g
+
+// Target home position – arm moves here gradually on startup
+const int homeAngles[6] = {90, 130, 180, 180, 180, 80};  // b, s, e, w, t, g
 
 String inputBuffer = "";
 bool newCommand = false;
+unsigned long lastSaveTime = 0;
+bool anglesDirty = false;
 
 void setup() {
   gripper.attach(GRIPPER_PIN);
@@ -29,14 +41,22 @@ void setup() {
 
   Serial.begin(115200);
   
-  base.write(currentAngles[0]);
-  shoulder.write(currentAngles[1]);
-  elbow.write(currentAngles[2]);
-  wrist.write(currentAngles[3]);
-  twist.write(currentAngles[4]);
-  gripper.write(currentAngles[5]);
-  
-  delay(500);
+  // Restore last known angles from EEPROM (falls back to defaults on first boot)
+  loadAnglesFromEEPROM();
+
+  // Hold the restored position so the arm doesn't jerk
+  for (int i = 0; i < 6; i++) {
+    writeToServo(i, currentAngles[i]);
+  }
+  delay(300);
+
+  // Gradually sweep to home position over ~10 seconds (100 steps × 100 ms)
+  smoothMoveTo(homeAngles, 100, 100);
+
+  // Persist the home position immediately
+  saveAnglesToEEPROM();
+
+  delay(200);
   sendFeedback();
 }
 
@@ -47,6 +67,50 @@ void loop() {
     parseCommand(inputBuffer);
     inputBuffer = "";
     newCommand = false;
+  }
+
+  // Save to EEPROM 1 second after the last movement (debounced)
+  if (anglesDirty && (millis() - lastSaveTime >= 1000)) {
+    saveAnglesToEEPROM();
+    anglesDirty = false;
+  }
+}
+
+void loadAnglesFromEEPROM() {
+  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VAL) return; // first boot, no valid data
+  for (int i = 0; i < 5; i++) {  // joints only (b,s,e,w,t) — gripper always starts at home
+    currentAngles[i] = EEPROM.read(EEPROM_BASE_ADDR + i);
+  }
+  // currentAngles[5] (gripper) intentionally keeps its init value (80 = closed)
+  // so the gripper never snaps open unexpectedly on power-up or reconnect
+}
+
+void saveAnglesToEEPROM() {
+  for (int i = 0; i < 6; i++) {
+    EEPROM.update(EEPROM_BASE_ADDR + i, (uint8_t)currentAngles[i]); // only writes if value changed
+  }
+  EEPROM.update(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VAL);
+  lastSaveTime = millis();
+}
+
+// Gradually move all servos from currentAngles to targetAngles
+void smoothMoveTo(const int targetAngles[], int steps, int stepDelay_ms) {
+  int startAngles[6];
+  for (int i = 0; i < 6; i++) startAngles[i] = currentAngles[i];
+
+  for (int step = 1; step <= steps; step++) {
+    for (int i = 0; i < 6; i++) {
+      int angle = startAngles[i] + (int)((float)(targetAngles[i] - startAngles[i]) * step / steps);
+      currentAngles[i] = angle;
+      writeToServo(i, angle);
+    }
+    delay(stepDelay_ms);
+  }
+
+  // Guarantee exact target values
+  for (int i = 0; i < 6; i++) {
+    currentAngles[i] = targetAngles[i];
+    writeToServo(i, targetAngles[i]);
   }
 }
 
@@ -100,6 +164,8 @@ void parseCommand(String cmd) {
     
     currentAngles[servoIndex] = angle;
     writeToServo(servoIndex, angle);
+    anglesDirty = true;
+    lastSaveTime = millis(); // reset 1-second cooldown on each new command
     
     startPos = commaPos + 1;
   }
