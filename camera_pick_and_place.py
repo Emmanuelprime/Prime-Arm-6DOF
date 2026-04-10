@@ -125,7 +125,7 @@ class CameraPickAndPlace:
         ttk.Label(rob_f, text="Port:").pack(side=tk.LEFT)
         import sys
         self.rob_port = tk.StringVar(
-            value='COM4' if sys.platform.startswith('win') else '/dev/serial0')
+            value='COM4' if sys.platform.startswith('win') else '/dev/ttyUSB0')
         ttk.Entry(rob_f, textvariable=self.rob_port, width=8).pack(side=tk.LEFT, padx=4)
         self.rob_btn = ttk.Button(rob_f, text="Connect", command=self._connect_robot)
         self.rob_btn.pack(side=tk.LEFT, padx=4)

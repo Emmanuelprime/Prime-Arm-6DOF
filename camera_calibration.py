@@ -272,7 +272,7 @@ class CameraCalibrationTool:
         ttk.Label(r_row, text="Port:").pack(side=tk.LEFT)
         import sys
         self.ac_port_var = tk.StringVar(
-            value='COM4' if sys.platform.startswith('win') else '/dev/serial0')
+            value='COM4' if sys.platform.startswith('win') else '/dev/ttyUSB0')
         ttk.Entry(r_row, textvariable=self.ac_port_var, width=7).pack(side=tk.LEFT, padx=4)
         self.ac_robot_btn = ttk.Button(r_row, text="Connect Robot",
                                        command=self._ac_toggle_robot)

@@ -575,7 +575,7 @@ def main():
     # Try to connect to robot (optional)
     robot = None
     try:
-        robot = RobotArmController(port='COM4' if tk.sys.platform.startswith('win') else '/dev/serial0')
+        robot = RobotArmController(port='COM4' if tk.sys.platform.startswith('win') else '/dev/ttyUSB0')
         if robot.connect():
             print("Robot connected")
         else:

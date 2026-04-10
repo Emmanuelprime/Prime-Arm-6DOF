@@ -43,7 +43,7 @@ class CubePickupGUI:
         ttk.Label(left, text="Port:").pack(side=tk.LEFT)
         import sys
         self.port_var = tk.StringVar(
-            value='COM4' if sys.platform.startswith('win') else '/dev/serial0')
+            value='COM4' if sys.platform.startswith('win') else '/dev/ttyUSB0')
         ttk.Entry(left, textvariable=self.port_var, width=10).pack(side=tk.LEFT, padx=4)
         ttk.Button(left, text="Connect", command=self._connect_robot).pack(side=tk.LEFT, padx=4)
 

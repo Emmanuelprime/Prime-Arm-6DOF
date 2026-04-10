@@ -13,9 +13,9 @@ import numpy as np
 from forward_kinematics import forward_kinematics, dh_matrix
 from inverse_kinematics_servo import calculate_ik
 
-# Pi Zero 2 W uses the hardware UART on GPIO 14/15 → /dev/serial0
+# Pi Zero 2 W: Arduino Nano over USB → /dev/ttyUSB0
 # Windows development uses COM4
-DEFAULT_PORT = '/dev/serial0' if not sys.platform.startswith('win') else 'COM4'
+DEFAULT_PORT = '/dev/ttyUSB0' if not sys.platform.startswith('win') else 'COM4'
 
 
 class RobotArmController:
