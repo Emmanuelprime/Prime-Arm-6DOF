@@ -222,7 +222,8 @@ class PickPlaceGUI:
             self.robot.disconnect()
         
         try:
-            self.robot = RobotArmController(port='COM4')
+            from raspberry_pi_controller import DEFAULT_PORT
+            self.robot = RobotArmController(port=DEFAULT_PORT)
             if self.robot.connect():
                 self.connection_label.config(text="🟢 Connected", foreground='green')
                 self.status_label.config(text="Robot connected successfully", foreground='green')

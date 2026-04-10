@@ -4,6 +4,7 @@ Raspberry Pi Controller for Prime-Arm Robot
 Handles serial communication with Arduino with smooth motion control
 """
 
+import sys
 import serial
 import time
 import threading
@@ -12,14 +13,18 @@ import numpy as np
 from forward_kinematics import forward_kinematics, dh_matrix
 from inverse_kinematics_servo import calculate_ik
 
+# Pi Zero 2 W uses the hardware UART on GPIO 14/15 → /dev/serial0
+# Windows development uses COM4
+DEFAULT_PORT = '/dev/serial0' if not sys.platform.startswith('win') else 'COM4'
+
 
 class RobotArmController:
-    def __init__(self, port='/dev/ttyACM0', baudrate=115200, step_delay=0.015):
+    def __init__(self, port=DEFAULT_PORT, baudrate=115200, step_delay=0.015):
         """
         Initialize the robot arm controller
         
         Args:
-            port: Serial port (default: /dev/ttyACM0 on Raspberry Pi)
+            port: Serial port (default: /dev/serial0 on Pi, COM4 on Windows)
             baudrate: Communication speed (default: 115200)
             step_delay: Delay between 1-degree steps in seconds (default: 0.015)
         """
@@ -690,7 +695,7 @@ class RobotArmController:
 
 def main():
     """Example usage"""
-    robot = RobotArmController(port='/dev/ttyACM0', baudrate=115200, step_delay=0.015)
+    robot = RobotArmController(port=DEFAULT_PORT, baudrate=115200, step_delay=0.015)
 
     if not robot.connect():
         print("Failed to connect. Check the port and try again.")

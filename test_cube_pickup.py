@@ -18,7 +18,8 @@ from raspberry_pi_controller import RobotArmController
 
 def main():
     # Initialize
-    robot = RobotArmController(port='COM4')
+    from raspberry_pi_controller import DEFAULT_PORT
+    robot = RobotArmController(port=DEFAULT_PORT)
     
     print("="*70)
     print("CUBE PICK AND PLACE TEST")

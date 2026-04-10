@@ -9,7 +9,8 @@ import time
 
 def main():
     # Initialize controller
-    robot = RobotArmController(port='COM4', baudrate=115200, step_delay=0.015)
+    from raspberry_pi_controller import DEFAULT_PORT
+    robot = RobotArmController(port=DEFAULT_PORT, baudrate=115200, step_delay=0.015)
     
     # Connect to Arduino
     print("Connecting to Arduino...")
