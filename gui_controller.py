@@ -81,7 +81,7 @@ class RobotArmGUI:
         
         ttk.Label(conn_frame, text="Port:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
         self.port_entry = ttk.Entry(conn_frame, width=20)
-        self.port_entry.insert(0, "COM4" if tk.sys.platform.startswith('win') else "/dev/ttyACM0")
+        self.port_entry.insert(0, "COM4" if tk.sys.platform.startswith('win') else "/dev/serial0")
         self.port_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 10))
         
         self.connect_btn = ttk.Button(conn_frame, text="Connect", command=self.toggle_connection)

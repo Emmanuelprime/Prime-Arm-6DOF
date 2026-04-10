@@ -19,11 +19,20 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
+#define LED_GPIO_NUM       4   // Onboard white flash LED (active HIGH)
+
 // WiFi credentials - YOUR NETWORK
-const char* ssid = "Emmanuel prime";
-const char* password = "12345678990";
+const char* ssid = "PrimeRobotics";
+const char* password = "primerobotics123";
+
+// Static IP configuration
+IPAddress staticIP(192, 168, 18, 110);   // desired static IP
+IPAddress gateway(192, 168, 18,   1);    // your router IP
+IPAddress subnet(255, 255, 255,   0);
+IPAddress dns(8, 8, 8, 8);
 
 WiFiServer server(80);
+WiFiServer ledServer(81);  // Dedicated LED control port
 
 void setup() {
   Serial.begin(115200);
@@ -63,6 +72,7 @@ void setup() {
   }
 
   // Connect to WiFi
+  WiFi.config(staticIP, gateway, subnet, dns);
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi...");
   
@@ -84,11 +94,45 @@ void setup() {
     Serial.println(WiFi.softAPIP());
   } else {
     Serial.println("\nWiFi connected!");
-    Serial.print("Stream URL: http://");
+    Serial.print("Static IP: http://");
     Serial.println(WiFi.localIP());
   }
 
+  // LED off by default
+  pinMode(LED_GPIO_NUM, OUTPUT);
+  digitalWrite(LED_GPIO_NUM, LOW);
+
   server.begin();
+  ledServer.begin();
+  Serial.println("LED control: http://<IP>:81/led/on  or  /led/off");
+}
+
+// ── Handles a single request on the LED server (port 81) ──────────────
+void handleLedServer() {
+  WiFiClient lc = ledServer.available();
+  if (!lc) return;
+  String req = "";
+  unsigned long t = millis();
+  while (lc.connected() && (millis() - t) < 200) {
+    if (lc.available()) {
+      char c = lc.read();
+      if (c == '\n') break;
+      if (c != '\r') req += c;
+    }
+  }
+  if (req.indexOf("/led/on") >= 0) {
+    digitalWrite(LED_GPIO_NUM, HIGH);
+    Serial.println("LED ON");
+  } else if (req.indexOf("/led/off") >= 0) {
+    digitalWrite(LED_GPIO_NUM, LOW);
+    Serial.println("LED OFF");
+  }
+  lc.println("HTTP/1.1 200 OK");
+  lc.println("Content-Type: text/plain");
+  lc.println("Access-Control-Allow-Origin: *");
+  lc.println();
+  lc.println("OK");
+  lc.stop();
 }
 
 void loop() {
@@ -96,35 +140,63 @@ void loop() {
   
   if (client) {
     Serial.println("New Client");
+    String requestLine = "";
     String currentLine = "";
-    
+    bool firstLine = true;
+
     while (client.connected()) {
       if (client.available()) {
         char c = client.read();
-        Serial.write(c);
-        
+
         if (c == '\n') {
+          if (firstLine) {
+            requestLine = currentLine;
+            firstLine = false;
+          }
+
           if (currentLine.length() == 0) {
-            // Send HTTP headers
+            // ── LED control endpoints ──────────────────────────────
+            if (requestLine.indexOf("GET /led/on") >= 0) {
+              digitalWrite(LED_GPIO_NUM, HIGH);
+              Serial.println("LED ON");
+              client.println("HTTP/1.1 200 OK");
+              client.println("Content-Type: text/plain");
+              client.println("Access-Control-Allow-Origin: *");
+              client.println();
+              client.println("LED ON");
+              break;
+            } else if (requestLine.indexOf("GET /led/off") >= 0) {
+              digitalWrite(LED_GPIO_NUM, LOW);
+              Serial.println("LED OFF");
+              client.println("HTTP/1.1 200 OK");
+              client.println("Content-Type: text/plain");
+              client.println("Access-Control-Allow-Origin: *");
+              client.println();
+              client.println("LED OFF");
+              break;
+            }
+
+            // ── MJPEG stream (default) ─────────────────────────────
             client.println("HTTP/1.1 200 OK");
             client.println("Content-type: multipart/x-mixed-replace; boundary=frame");
             client.println();
-            
-            // Stream frames
+
             while (client.connected()) {
+              handleLedServer();  // service LED requests while streaming
+
               camera_fb_t *fb = esp_camera_fb_get();
               if (!fb) {
                 Serial.println("Camera capture failed");
                 break;
               }
-              
+
               client.println("--frame");
               client.println("Content-Type: image/jpeg");
               client.println("Content-Length: " + String(fb->len));
               client.println();
               client.write(fb->buf, fb->len);
               client.println();
-              
+
               esp_camera_fb_return(fb);
               delay(30);  // Adjust frame rate
             }
