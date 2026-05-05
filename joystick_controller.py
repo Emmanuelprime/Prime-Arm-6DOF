@@ -334,11 +334,23 @@ class JoystickController:
             actual = self.robot.get_current_angles()
             for j in JOINTS:
                 self.target_angles[j] = actual[j]
-            self.gripper = actual.get('g', G_CLOSE)
+            # Snap to nearest valid state so self.gripper and UI always agree
+            raw_g = actual.get('g', G_CLOSE)
+            self.gripper = G_OPEN if raw_g <= (G_OPEN + G_CLOSE) // 2 else G_CLOSE
             self._update_joint_display(self.target_angles)
+            self._sync_gripper_ui()
             self.update_info("Angles refreshed")
         except Exception as e:
             self.update_info(f"Error refreshing angles: {e}")
+
+    def _sync_gripper_ui(self):
+        """Update gripper button and label to match self.gripper."""
+        if self.gripper == G_OPEN:
+            self.grip_lbl.config(text="OPEN", foreground='green')
+            self.grip_btn.config(text="Close Gripper (G)")
+        else:
+            self.grip_lbl.config(text="CLOSED", foreground='red')
+            self.grip_btn.config(text="Open Gripper (G)")
 
     # ═══════════════════════════════════════════════════════════ UDP listener ═
     def _start_udp_listener(self):
@@ -476,12 +488,7 @@ class JoystickController:
         if not self.connected or self.sending_command:
             return
         self.gripper = G_OPEN if self.gripper == G_CLOSE else G_CLOSE
-        label  = "OPEN"  if self.gripper == G_OPEN  else "CLOSED"
-        colour = 'green' if self.gripper == G_OPEN  else 'red'
-        btn_t  = ("Close Gripper (G)" if self.gripper == G_OPEN
-                  else "Open Gripper (G)")
-        self.grip_lbl.config(text=label, foreground=colour)
-        self.grip_btn.config(text=btn_t)
+        self._sync_gripper_ui()
 
         cmd = {j: int(round(self.target_angles[j])) for j in JOINTS}
         cmd['g'] = self.gripper
@@ -491,7 +498,8 @@ class JoystickController:
         def send():
             try:
                 self.robot._stream_command(cmd)
-                self.update_info(f"Gripper {label.lower()}")
+                label = "open" if self.gripper == G_OPEN else "closed"
+                self.update_info(f"Gripper {label}")
             except Exception as e:
                 self.update_info(f"Error: {e}")
             finally:
