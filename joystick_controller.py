@@ -461,30 +461,13 @@ class JoystickController:
         threading.Thread(target=send, daemon=True).start()
 
     def go_home(self):
-        """Mirrors gui_controller.go_home."""
-        if not self.connected or self.sending_command:
+        """Set target_angles to HOME and let the control loop drive the arm there smoothly."""
+        if not self.connected:
             return
-
-        def move_home():
-            self.sending_command = True
-            try:
-                self.update_info("Moving to home position...")
-                self.robot.home_position(smooth=True, display_progress=False)
-
-                for j in JOINTS:
-                    self.target_angles[j] = HOME[j]
-                self.gripper = HOME['g']
-                # Update sliders to home position (mirrors gui_controller)
-                self.root.after(0, lambda: self._update_joint_display(
-                    {j: HOME[j] for j in JOINTS}))
-                self.update_info("Home position reached")
-                self._log("Home reached.")
-            except Exception as e:
-                self.update_info(f"Error: {e}")
-            finally:
-                self.sending_command = False
-
-        threading.Thread(target=move_home, daemon=True).start()
+        for j in JOINTS:
+            self.target_angles[j] = float(HOME[j])
+        self.update_info("Going home...")
+        self._log("Going home.")
 
     # ═════════════════════════════════════════════════════════ display helpers ═
     def _update_joint_display(self, angles):
