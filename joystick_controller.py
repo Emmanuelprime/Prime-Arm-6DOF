@@ -61,8 +61,6 @@ class JoystickController:
         # Robot state  (mirrors gui_controller)
         self.robot           = None
         self.connected       = False
-        self.running         = False
-        self.update_thread   = None
         self.sending_command = False
 
         # Joint targets
@@ -287,12 +285,6 @@ class JoystickController:
                 # Sync local targets with actual robot angles (like refresh_angles)
                 self.refresh_angles()
 
-                # Start background update loop (mirrors gui_controller)
-                self.running = True
-                self.update_thread = threading.Thread(
-                    target=self.update_loop, daemon=True)
-                self.update_thread.start()
-
                 self.update_info("Connected successfully!")
                 self._log(f"Robot connected on {port}.")
             else:
@@ -307,7 +299,6 @@ class JoystickController:
 
     def disconnect(self):
         """Mirrors gui_controller.disconnect."""
-        self.running = False
         if self.robot:
             self.robot.disconnect()
             self.robot = None
@@ -334,24 +325,6 @@ class JoystickController:
             self.update_info("Angles refreshed")
         except Exception as e:
             self.update_info(f"Error refreshing angles: {e}")
-
-    # ═══════════════════════════════════════════════════════════ update_loop ═══
-    def update_loop(self):
-        """Background thread: poll actual angles every 0.5 s, update labels.
-        Mirrors gui_controller.update_loop exactly."""
-        while self.running and self.connected:
-            time.sleep(0.5)
-            if self.connected and not self.sending_command:
-                try:
-                    actual = self.robot.get_current_angles()
-                    # Update labels only — don't overwrite target_angles mid-move
-                    for j in JOINTS:
-                        angle = actual[j]
-                        self.root.after(
-                            0, lambda s=j, a=angle:
-                            self.angle_labels[s].config(text=f"{a:3d}°"))
-                except Exception:
-                    pass
 
     # ═══════════════════════════════════════════════════════════ UDP listener ═
     def _start_udp_listener(self):
