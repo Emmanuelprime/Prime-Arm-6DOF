@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Joystick Controller for Prime-Arm
-==================================
-Receives UDP JSON packets from the drone-controller joystick firmware and maps
+Receives UDP JSON packets from the drone-controller ESP32 joystick and maps
 stick axes to robot joint angles via smooth joint-space control.
 
 Default axis → joint mapping:
@@ -11,12 +10,12 @@ Default axis → joint mapping:
   Left  Y (ly)  →  Elbow    (e)
   Left  X (lx)  →  Wrist    (w)
 
-Twist is controlled by a GUI slider or left unmapped.
-Gripper is toggled via a GUI button or the G key.
+Gripper is toggled via the GUI button or G key.
+Home is triggered via the GUI button or H key.
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext
 import socket
 import threading
 import json
@@ -25,14 +24,13 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from raspberry_pi_controller import RobotArmController, DEFAULT_PORT
 
-# ─────────────────────────────────────────────── constants ────────────────────
+# ───────────────────────────────────────────────────────────── constants ──────
 UDP_PORT    = 4210
 UPDATE_HZ   = 50
 DT          = 1.0 / UPDATE_HZ
-JOY_TIMEOUT = 0.5   # seconds — treat axes as zero if silent for this long
+JOY_TIMEOUT = 0.5        # seconds — treat axes as zero if no packet this long
 
 JOINTS      = ('b', 's', 'e', 'w', 't')
 JOINT_NAMES = {'b': 'Base', 's': 'Shoulder', 'e': 'Elbow',
@@ -44,250 +42,319 @@ G_OPEN      = 30
 G_CLOSE     = 80
 
 AXES        = ('rx', 'ry', 'lx', 'ly')
-AXIS_LABELS = {'rx': 'Right X', 'ry': 'Right Y', 'lx': 'Left X', 'ly': 'Left Y'}
+AXIS_LABELS = {'rx': 'Right X', 'ry': 'Right Y',
+               'lx': 'Left X',  'ly': 'Left Y'}
+# axis → (joint, default_sign)
+DEFAULT_MAP = {'rx': ('b', +1), 'ry': ('s', +1),
+               'ly': ('e', +1), 'lx': ('w', +1)}
 
-# axis → (joint, default_sign)  — sign can be flipped in the GUI
-DEFAULT_MAP = {
-    'rx': ('b', +1),
-    'ry': ('s', +1),
-    'ly': ('e', +1),
-    'lx': ('w', +1),
-}
 
-# ─────────────────────────────────────────────────────────── GUI ──────────────
+# ─────────────────────────────────────────────────────────────────── GUI ──────
 class JoystickController:
 
     def __init__(self, root):
-        self.root  = root
-        self.root.title("Prime-Arm — Joystick Controller")
-        self.root.geometry("860x680")
+        self.root = root
+        self.root.title("Prime-Arm Joystick Controller")
+        self.root.geometry("820x620")
         self.root.resizable(True, True)
 
-        # Robot state
-        self.robot   = None
-        self.angles  = {**HOME}          # current target angles
-        self.gripper = G_CLOSE           # start closed
-        self._angle_lock = threading.Lock()
+        # Robot state  (mirrors gui_controller)
+        self.robot           = None
+        self.connected       = False
+        self.running         = False
+        self.update_thread   = None
+        self.sending_command = False
+
+        # Joint targets
+        self.target_angles = {j: HOME[j] for j in JOINTS}
+        self.gripper       = G_CLOSE
 
         # Joystick state
-        self._joy_lock    = threading.Lock()
-        self._joy         = {a: 0.0 for a in AXES}
-        self._last_joy_t  = 0.0
-        self._packets     = 0
+        self._joy_lock   = threading.Lock()
+        self._joy        = {a: 0.0 for a in AXES}
+        self._last_joy_t = 0.0
+        self._packets    = 0
 
-        # Mapping: axis → [joint_var, sign_var]
+        # Axis → joint mapping (GUI-configurable)
         self._map_joint = {a: tk.StringVar(value=DEFAULT_MAP[a][0]) for a in AXES}
         self._map_sign  = {a: tk.IntVar(value=DEFAULT_MAP[a][1])    for a in AXES}
 
-        # Speed (degrees / second at full deflection)
+        # Speed (°/s at full deflection)
         self.speed_var = tk.DoubleVar(value=60.0)
 
-        # Threads
-        self._udp_running     = False
+        # Control loop flag
         self._control_running = False
 
-        self._build_ui()
+        self.create_widgets()
         self._start_udp_listener()
         self._start_control_loop()
 
-        self.root.bind('<g>', lambda e: self._toggle_gripper())
-        self.root.bind('<G>', lambda e: self._toggle_gripper())
-        self.root.bind('<h>', lambda e: self._go_home())
-        self.root.bind('<H>', lambda e: self._go_home())
+        self.root.bind('<g>', lambda e: self.toggle_gripper())
+        self.root.bind('<G>', lambda e: self.toggle_gripper())
+        self.root.bind('<h>', lambda e: self.go_home())
+        self.root.bind('<H>', lambda e: self.go_home())
 
-    # ═══════════════════════════════════════════════════════════ build UI ══════
-    def _build_ui(self):
+    # ══════════════════════════════════════════════════════════ create_widgets ═
+    def create_widgets(self):
+        """Create GUI widgets — mirrors gui_controller.create_widgets."""
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
         self.root.columnconfigure(0, weight=1)
-        self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(2, weight=1)
 
-        # ── Left column ──────────────────────────────────────────────────────
-        left = ttk.Frame(self.root, padding=8)
-        left.grid(row=0, column=0, sticky='nsew')
+        # ── Title ─────────────────────────────────────────────────────────────
+        ttk.Label(main_frame, text="Prime-Arm Joystick Controller",
+                  font=('Arial', 16, 'bold')).grid(
+            row=0, column=0, columnspan=2, pady=(0, 10))
+
+        # ── Connection (mirrors gui_controller connection frame) ───────────────
+        conn_frame = ttk.LabelFrame(main_frame, text="Connection", padding="10")
+        conn_frame.grid(row=1, column=0, columnspan=2,
+                        sticky=(tk.W, tk.E), pady=(0, 10))
+        conn_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(conn_frame, text="Port:").grid(
+            row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.port_entry = ttk.Entry(conn_frame, width=20)
+        self.port_entry.insert(0, DEFAULT_PORT)
+        self.port_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 10))
+
+        self.connect_btn = ttk.Button(conn_frame, text="Connect",
+                                      command=self.toggle_connection)
+        self.connect_btn.grid(row=0, column=2)
+
+        self.status_label = ttk.Label(conn_frame, text="● Disconnected",
+                                      foreground="red")
+        self.status_label.grid(row=0, column=3, padx=(10, 0))
+
+        self.udp_label = ttk.Label(conn_frame,
+                                   text=f"  |  UDP :{UDP_PORT} …",
+                                   foreground="gray")
+        self.udp_label.grid(row=0, column=4, padx=(10, 0))
+
+        self.pkt_label = ttk.Label(conn_frame, text="pkts: 0",
+                                   font=('Consolas', 8), foreground="gray")
+        self.pkt_label.grid(row=0, column=5, padx=(10, 0))
+
+        # ── Left column ───────────────────────────────────────────────────────
+        left = ttk.Frame(main_frame)
+        left.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
         left.columnconfigure(0, weight=1)
 
-        # Robot connection
-        conn_f = ttk.LabelFrame(left, text="Robot Connection", padding=6)
-        conn_f.grid(row=0, column=0, sticky='ew', pady=(0, 8))
+        # Live axes
+        axes_frame = ttk.LabelFrame(left, text="Live Axes", padding="10")
+        axes_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        axes_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(conn_f, text="Port:").pack(side=tk.LEFT)
-        import sys as _sys
-        self.port_var = tk.StringVar(
-            value='COM4' if _sys.platform.startswith('win') else '/dev/ttyUSB0')
-        ttk.Entry(conn_f, textvariable=self.port_var, width=14).pack(side=tk.LEFT, padx=4)
-        self.conn_btn = ttk.Button(conn_f, text="Connect Robot",
-                                   command=self._toggle_robot)
-        self.conn_btn.pack(side=tk.LEFT, padx=4)
-        self.conn_lbl = ttk.Label(conn_f, text="⚫ Not connected",
-                                  foreground='red', font=('Arial', 9, 'bold'))
-        self.conn_lbl.pack(side=tk.LEFT, padx=4)
-
-        # UDP status
-        udp_f = ttk.LabelFrame(left, text="UDP (Joystick)", padding=6)
-        udp_f.grid(row=1, column=0, sticky='ew', pady=(0, 8))
-        self.udp_lbl = ttk.Label(udp_f, text=f"⚫ Listening on :{UDP_PORT}…",
-                                 font=('Arial', 9))
-        self.udp_lbl.pack(side=tk.LEFT)
-        self.pkt_lbl = ttk.Label(udp_f, text="pkts: 0",
-                                 font=('Consolas', 8), foreground='gray')
-        self.pkt_lbl.pack(side=tk.RIGHT)
-
-        # Axis bars
-        axes_f = ttk.LabelFrame(left, text="Live Axes", padding=6)
-        axes_f.grid(row=2, column=0, sticky='ew', pady=(0, 8))
-        axes_f.columnconfigure(1, weight=1)
-
-        self._axis_bars  = {}
-        self._axis_vals  = {}
+        self.axis_bars = {}
+        self.axis_vals = {}
         for r, ax in enumerate(AXES):
-            ttk.Label(axes_f, text=AXIS_LABELS[ax] + ":",
-                      width=10, anchor='e').grid(row=r, column=0, sticky='e', padx=(0, 4))
-            bar = ttk.Progressbar(axes_f, orient='horizontal',
-                                  length=180, maximum=200, value=100)
+            ttk.Label(axes_frame, text=AXIS_LABELS[ax] + ":",
+                      width=10, anchor='e').grid(
+                row=r, column=0, sticky='e', padx=(0, 4))
+            bar = ttk.Progressbar(axes_frame, orient='horizontal',
+                                  length=160, maximum=200, value=100)
             bar.grid(row=r, column=1, sticky='ew', pady=1)
-            val = ttk.Label(axes_f, text=" 0.000", font=('Consolas', 9), width=7)
+            val = ttk.Label(axes_frame, text=" 0.000",
+                            font=('Consolas', 9), width=7)
             val.grid(row=r, column=2, sticky='w', padx=4)
-            self._axis_bars[ax] = bar
-            self._axis_vals[ax] = val
+            self.axis_bars[ax] = bar
+            self.axis_vals[ax] = val
 
-        # Joint angles display
-        jt_f = ttk.LabelFrame(left, text="Joint Angles", padding=6)
-        jt_f.grid(row=3, column=0, sticky='ew', pady=(0, 8))
-        jt_f.columnconfigure(1, weight=1)
+        # Joint angles (mirrors gui_controller servo controls)
+        joints_frame = ttk.LabelFrame(left, text="Joint Angles", padding="10")
+        joints_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        joints_frame.columnconfigure(1, weight=1)
 
-        self._joint_bars = {}
-        self._joint_lbls = {}
+        self.angle_bars   = {}
+        self.angle_labels = {}
         for r, j in enumerate(JOINTS):
-            ttk.Label(jt_f, text=f"{JOINT_NAMES[j]}:",
-                      width=10, anchor='e').grid(row=r, column=0, sticky='e', padx=(0, 4))
-            bar = ttk.Progressbar(jt_f, orient='horizontal',
-                                  length=180, maximum=180, value=self.angles[j])
-            bar.grid(row=r, column=1, sticky='ew', pady=1)
-            lbl = ttk.Label(jt_f, text=f"{self.angles[j]:3d}°",
-                            font=('Consolas', 9), width=5)
-            lbl.grid(row=r, column=2, sticky='w', padx=4)
-            self._joint_bars[j] = bar
-            self._joint_lbls[j] = lbl
+            ttk.Label(joints_frame, text=f"{JOINT_NAMES[j]}:",
+                      font=('Arial', 10, 'bold'), width=10).grid(
+                row=r, column=0, sticky=tk.W, pady=5)
+            bar = ttk.Progressbar(joints_frame, orient='horizontal',
+                                  length=160, maximum=180,
+                                  value=self.target_angles[j])
+            bar.grid(row=r, column=1, sticky='ew', padx=(10, 10))
+            lbl = ttk.Label(joints_frame,
+                            text=f"{self.target_angles[j]:3d}°",
+                            font=('Arial', 10), width=6)
+            lbl.grid(row=r, column=2, sticky=tk.E)
+            self.angle_bars[j]   = bar
+            self.angle_labels[j] = lbl
 
-        # Gripper
-        g_f = ttk.LabelFrame(left, text="Gripper  (G key)", padding=6)
-        g_f.grid(row=4, column=0, sticky='ew', pady=(0, 8))
-        self.grip_btn = ttk.Button(g_f, text="🤚 Open Gripper",
-                                   command=self._toggle_gripper)
-        self.grip_btn.pack(side=tk.LEFT, padx=4)
-        self.grip_lbl = ttk.Label(g_f, text="CLOSED", foreground='red',
-                                  font=('Arial', 9, 'bold'))
-        self.grip_lbl.pack(side=tk.LEFT, padx=8)
+        # Control buttons (mirrors gui_controller button_frame)
+        ctrl_frame = ttk.LabelFrame(left, text="Control", padding="10")
+        ctrl_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
 
-        # Home button
-        home_f = ttk.Frame(left)
-        home_f.grid(row=5, column=0, sticky='ew', pady=(0, 4))
-        ttk.Button(home_f, text="🏠 Home  (H key)",
-                   command=self._go_home).pack(side=tk.LEFT, padx=2)
+        self.home_btn = ttk.Button(ctrl_frame, text="Home Position (H)",
+                                   command=self.go_home, state='disabled')
+        self.home_btn.grid(row=0, column=0, padx=5)
 
-        # ── Right column ─────────────────────────────────────────────────────
-        right = ttk.Frame(self.root, padding=8)
-        right.grid(row=0, column=1, sticky='nsew')
+        self.grip_btn = ttk.Button(ctrl_frame, text="Open Gripper (G)",
+                                   command=self.toggle_gripper, state='disabled')
+        self.grip_btn.grid(row=0, column=1, padx=5)
+
+        self.grip_lbl = ttk.Label(ctrl_frame, text="CLOSED",
+                                  foreground='red', font=('Arial', 9, 'bold'))
+        self.grip_lbl.grid(row=0, column=2, padx=(8, 0))
+
+        # ── Right column ──────────────────────────────────────────────────────
+        right = ttk.Frame(main_frame)
+        right.grid(row=2, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(3, weight=1)
+        right.rowconfigure(2, weight=1)
 
-        # Speed
-        spd_f = ttk.LabelFrame(right, text="Speed  (°/s at full stick)", padding=6)
-        spd_f.grid(row=0, column=0, sticky='ew', pady=(0, 8))
-        ttk.Scale(spd_f, variable=self.speed_var,
-                  from_=5, to=180, orient='horizontal').pack(fill='x', padx=4)
-        self.spd_lbl = ttk.Label(spd_f, font=('Consolas', 9))
+        # Speed slider
+        spd_frame = ttk.LabelFrame(right, text="Speed  (°/s at full stick)",
+                                   padding="10")
+        spd_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        ttk.Scale(spd_frame, variable=self.speed_var,
+                  from_=5, to=180, orient='horizontal',
+                  command=lambda v: self._update_speed_label()).pack(
+            fill='x', padx=4)
+        self.spd_lbl = ttk.Label(spd_frame, font=('Consolas', 9))
         self.spd_lbl.pack()
-        self.speed_var.trace_add('write', lambda *_: self._update_speed_label())
         self._update_speed_label()
 
-        # Axis mapping
-        map_f = ttk.LabelFrame(right, text="Axis → Joint Mapping", padding=6)
-        map_f.grid(row=1, column=0, sticky='ew', pady=(0, 8))
-        map_f.columnconfigure(1, weight=1)
+        # Axis → joint mapping
+        map_frame = ttk.LabelFrame(right, text="Axis → Joint Mapping",
+                                   padding="10")
+        map_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        map_frame.columnconfigure(1, weight=1)
 
         joint_opts = list(JOINTS) + ['—']
         for r, ax in enumerate(AXES):
-            ttk.Label(map_f, text=AXIS_LABELS[ax] + ":",
-                      width=10, anchor='e').grid(row=r, column=0, sticky='e', padx=(0, 4), pady=2)
-            cb = ttk.Combobox(map_f, textvariable=self._map_joint[ax],
-                              values=joint_opts, width=8, state='readonly')
-            cb.grid(row=r, column=1, sticky='w', padx=4)
-            sign_frame = ttk.Frame(map_f)
-            sign_frame.grid(row=r, column=2, sticky='w')
-            ttk.Radiobutton(sign_frame, text="+", variable=self._map_sign[ax],
-                            value=+1).pack(side=tk.LEFT)
-            ttk.Radiobutton(sign_frame, text="−", variable=self._map_sign[ax],
-                            value=-1).pack(side=tk.LEFT)
-
-        # Tips
-        tips_f = ttk.LabelFrame(right, text="Keyboard Shortcuts", padding=6)
-        tips_f.grid(row=2, column=0, sticky='ew', pady=(0, 8))
-        tips = [("G", "Toggle gripper"), ("H", "Go home")]
-        for i, (key, desc) in enumerate(tips):
-            ttk.Label(tips_f, text=key, font=('Consolas', 9, 'bold'),
-                      width=4).grid(row=i, column=0, sticky='e')
-            ttk.Label(tips_f, text=desc, foreground='gray').grid(
-                row=i, column=1, sticky='w', padx=6)
+            ttk.Label(map_frame, text=AXIS_LABELS[ax] + ":",
+                      width=10, anchor='e').grid(
+                row=r, column=0, sticky='e', padx=(0, 4), pady=2)
+            ttk.Combobox(map_frame, textvariable=self._map_joint[ax],
+                         values=joint_opts, width=8,
+                         state='readonly').grid(
+                row=r, column=1, sticky='w', padx=4)
+            sf = ttk.Frame(map_frame)
+            sf.grid(row=r, column=2, sticky='w')
+            ttk.Radiobutton(sf, text="+",
+                            variable=self._map_sign[ax], value=+1).pack(side=tk.LEFT)
+            ttk.Radiobutton(sf, text="−",
+                            variable=self._map_sign[ax], value=-1).pack(side=tk.LEFT)
 
         # Log
-        log_f = ttk.LabelFrame(right, text="Log", padding=4)
-        log_f.grid(row=3, column=0, sticky='nsew')
-        log_f.columnconfigure(0, weight=1)
-        log_f.rowconfigure(0, weight=1)
-        self.log = scrolledtext.ScrolledText(log_f, height=12, font=('Consolas', 8),
-                                              state='disabled', wrap=tk.WORD)
-        self.log.grid(row=0, column=0, sticky='nsew')
+        log_frame = ttk.LabelFrame(right, text="Log", padding=4)
+        log_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log_box = scrolledtext.ScrolledText(log_frame, height=10,
+                                                 font=('Consolas', 8),
+                                                 state='disabled', wrap=tk.WORD)
+        self.log_box.grid(row=0, column=0, sticky='nsew')
 
-    # ═══════════════════════════════════════════════ robot connection ══════════
-    def _toggle_robot(self):
-        if self.robot is not None:
+        # ── Status bar (mirrors gui_controller) ───────────────────────────────
+        status_bar = ttk.Frame(main_frame, relief=tk.SUNKEN)
+        status_bar.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E))
+        self.info_label = ttk.Label(status_bar,
+                                    text="Ready. Please connect to Arduino.",
+                                    font=('Arial', 9))
+        self.info_label.pack(side=tk.LEFT, padx=5, pady=2)
+
+    # ══════════════════════════════════════════════════════════════ connection ═
+    def toggle_connection(self):
+        """Mirrors gui_controller.toggle_connection."""
+        if not self.connected:
+            self.connect()
+        else:
+            self.disconnect()
+
+    def connect(self):
+        """Mirrors gui_controller.connect — synchronous, shows messagebox on error."""
+        port = self.port_entry.get()
+        try:
+            self.update_info("Connecting...")
+            self.robot = RobotArmController(port=port, baudrate=115200,
+                                            step_delay=0.015)
+            if self.robot.connect():
+                self.connected = True
+                self.connect_btn.config(text="Disconnect")
+                self.status_label.config(text="● Connected", foreground="green")
+                self.home_btn.config(state='normal')
+                self.grip_btn.config(state='normal')
+                self.port_entry.config(state='disabled')
+
+                # Sync local targets with actual robot angles (like refresh_angles)
+                self.refresh_angles()
+
+                # Start background update loop (mirrors gui_controller)
+                self.running = True
+                self.update_thread = threading.Thread(
+                    target=self.update_loop, daemon=True)
+                self.update_thread.start()
+
+                self.update_info("Connected successfully!")
+                self._log(f"Robot connected on {port}.")
+            else:
+                messagebox.showerror("Connection Error",
+                                     "Failed to connect to Arduino")
+                self.update_info("Connection failed")
+                self.robot = None
+        except Exception as e:
+            messagebox.showerror("Error", f"Connection error: {e}")
+            self.update_info(f"Error: {e}")
+            self.robot = None
+
+    def disconnect(self):
+        """Mirrors gui_controller.disconnect."""
+        self.running = False
+        if self.robot:
             self.robot.disconnect()
             self.robot = None
-            self.conn_btn.config(text="Connect Robot")
-            self.conn_lbl.config(text="⚫ Not connected", foreground='red')
-            self._log("Robot disconnected.")
+        self.connected = False
+        self.connect_btn.config(text="Connect")
+        self.status_label.config(text="● Disconnected", foreground="red")
+        self.home_btn.config(state='disabled')
+        self.grip_btn.config(state='disabled')
+        self.port_entry.config(state='normal')
+        self.update_info("Disconnected")
+        self._log("Robot disconnected.")
+
+    def refresh_angles(self):
+        """Read current angles from the robot and sync target_angles + display.
+        Mirrors gui_controller.refresh_angles."""
+        if not self.connected:
             return
+        try:
+            actual = self.robot.get_current_angles()
+            for j in JOINTS:
+                self.target_angles[j] = actual[j]
+            self.gripper = actual.get('g', G_CLOSE)
+            self._update_joint_display(self.target_angles)
+            self.update_info("Angles refreshed")
+        except Exception as e:
+            self.update_info(f"Error refreshing angles: {e}")
 
-        port = self.port_var.get().strip()
-        self.conn_lbl.config(text="🟡 Connecting…", foreground='orange')
-        self.conn_btn.config(state='disabled')
+    # ═══════════════════════════════════════════════════════════ update_loop ═══
+    def update_loop(self):
+        """Background thread: poll actual angles every 0.5 s, update labels.
+        Mirrors gui_controller.update_loop exactly."""
+        while self.running and self.connected:
+            time.sleep(0.5)
+            if self.connected and not self.sending_command:
+                try:
+                    actual = self.robot.get_current_angles()
+                    # Update labels only — don't overwrite target_angles mid-move
+                    for j in JOINTS:
+                        angle = actual[j]
+                        self.root.after(
+                            0, lambda s=j, a=angle:
+                            self.angle_labels[s].config(text=f"{a:3d}°"))
+                except Exception:
+                    pass
 
-        def do():
-            try:
-                robot = RobotArmController(port=port)
-                if robot.connect():
-                    # Sync local angles with actual robot
-                    actual = robot.get_current_angles()
-                    with self._angle_lock:
-                        for j in JOINTS:
-                            self.angles[j] = actual[j]
-                        self.gripper = actual['g']
-                    self.robot = robot
-                    def ok():
-                        self.conn_lbl.config(text="🟢 Connected", foreground='green')
-                        self.conn_btn.config(text="Disconnect Robot", state='normal')
-                        self._log(f"Robot connected on {port}.")
-                    self.root.after(0, ok)
-                else:
-                    def fail():
-                        self.conn_lbl.config(text="⚫ Failed", foreground='red')
-                        self.conn_btn.config(text="Connect Robot", state='normal')
-                        self._log(f"✗ Could not connect on {port}.")
-                    self.root.after(0, fail)
-            except Exception as e:
-                msg = str(e)
-                def err():
-                    self.conn_lbl.config(text="⚫ Error", foreground='red')
-                    self.conn_btn.config(text="Connect Robot", state='normal')
-                    self._log(f"✗ {msg}")
-                self.root.after(0, err)
-
-        threading.Thread(target=do, daemon=True).start()
-
-    # ═════════════════════════════════════════════════════ UDP listener ════════
+    # ═══════════════════════════════════════════════════════════ UDP listener ═
     def _start_udp_listener(self):
-        self._udp_running = True
         threading.Thread(target=self._udp_loop, daemon=True).start()
 
     def _udp_loop(self):
@@ -296,18 +363,19 @@ class JoystickController:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(('', UDP_PORT))
             sock.settimeout(1.0)
-            self.root.after(0, lambda: self.udp_lbl.config(
-                text=f"🟢 Listening on :{UDP_PORT}", foreground='green'))
-            self._log(f"UDP listening on port {UDP_PORT}")
+            self.root.after(0, lambda: self.udp_label.config(
+                text=f"  |  UDP :{UDP_PORT} listening",
+                foreground='green'))
+            self._log(f"UDP listening on port {UDP_PORT}.")
         except Exception as e:
-            self.root.after(0, lambda: self.udp_lbl.config(
-                text=f"⚫ UDP error: {e}", foreground='red'))
-            self._log(f"✗ UDP bind error: {e}")
+            self.root.after(0, lambda: self.udp_label.config(
+                text=f"  |  UDP error: {e}", foreground='red'))
+            self._log(f"UDP bind error: {e}")
             return
 
-        while self._udp_running:
+        while True:
             try:
-                data, addr = sock.recvfrom(256)
+                data, _ = sock.recvfrom(256)
                 pkt = json.loads(data.decode())
                 with self._joy_lock:
                     for ax in AXES:
@@ -320,10 +388,9 @@ class JoystickController:
                 continue
             except Exception:
                 break
-
         sock.close()
 
-    # ═══════════════════════════════════════════════════ control loop ══════════
+    # ════════════════════════════════════════════════════════ control loop ══════
     def _start_control_loop(self):
         self._control_running = True
         threading.Thread(target=self._control_loop, daemon=True).start()
@@ -338,118 +405,149 @@ class JoystickController:
                 time.sleep(remaining)
 
     def _tick(self):
-        # Read joystick (zero if stale)
+        """One control cycle: read joystick, compute deltas, send command.
+        Uses sending_command guard — same pattern as gui_controller."""
         now = time.monotonic()
         with self._joy_lock:
-            if now - self._last_joy_t > JOY_TIMEOUT:
-                axes = {a: 0.0 for a in AXES}
-            else:
-                axes = dict(self._joy)
-            pkts = self._packets
+            stale = (now - self._last_joy_t) > JOY_TIMEOUT
+            axes  = {a: 0.0 for a in AXES} if stale else dict(self._joy)
+            pkts  = self._packets
 
-        speed = self.speed_var.get()
+        # Always refresh axis display
+        self.root.after(0, lambda a=dict(axes), p=pkts, s=stale:
+                        self._update_axis_display(a, p, s))
+
+        if not self.connected or self.sending_command:
+            return
+
+        speed   = self.speed_var.get()
         changed = False
+        new_angles = dict(self.target_angles)
 
-        with self._angle_lock:
-            new_angles = dict(self.angles)
-            for ax in AXES:
-                joint = self._map_joint[ax].get()
-                if joint == '—' or joint not in LIMITS:
-                    continue
-                sign  = self._map_sign[ax].get()
-                delta = axes[ax] * sign * speed * DT
-                if abs(delta) < 0.01:
-                    continue
-                lo, hi = LIMITS[joint]
-                new_angles[joint] = max(lo, min(hi, new_angles[joint] + delta))
-                changed = True
+        for ax in AXES:
+            joint = self._map_joint[ax].get()
+            if joint == '—' or joint not in LIMITS:
+                continue
+            sign  = self._map_sign[ax].get()
+            delta = axes[ax] * sign * speed * DT
+            if abs(delta) < 0.01:
+                continue
+            lo, hi = LIMITS[joint]
+            new_angles[joint] = max(lo, min(hi, new_angles[joint] + delta))
+            changed = True
 
-            if changed:
-                self.angles = new_angles
+        if not changed:
+            return
 
-        if changed and self.robot is not None:
+        self.target_angles = new_angles
+        cmd = {j: int(round(new_angles[j])) for j in JOINTS}
+        cmd['g'] = self.gripper
+
+        # Send in background thread with sending_command guard
+        # (mirrors gui_controller.send_servo_command)
+        self.sending_command = True
+
+        def send(c=cmd, a=dict(new_angles)):
             try:
-                cmd = {j: int(round(new_angles[j])) for j in JOINTS}
-                cmd['g'] = self.gripper
-                self.robot._stream_command(cmd)
-            except Exception:
-                pass
+                self.robot._stream_command(c)
+            except Exception as e:
+                self.root.after(0, lambda: self.update_info(f"Error: {e}"))
+            finally:
+                self.sending_command = False
+            self.root.after(0, lambda: self._update_joint_display(a))
 
-        # Update GUI (throttled to ~15 fps via after)
-        self.root.after(0, lambda a=dict(new_angles), p=pkts: self._update_display(a, p))
+        threading.Thread(target=send, daemon=True).start()
 
-    # ═════════════════════════════════════════════════════ gripper / home ══════
-    def _toggle_gripper(self):
+    # ════════════════════════════════════════════════════ gripper / home ═══════
+    def toggle_gripper(self):
+        """Mirrors gui_controller button handler style."""
+        if not self.connected or self.sending_command:
+            return
         self.gripper = G_OPEN if self.gripper == G_CLOSE else G_CLOSE
         label  = "OPEN"  if self.gripper == G_OPEN  else "CLOSED"
         colour = 'green' if self.gripper == G_OPEN  else 'red'
-        btn_t  = "🤚 Open Gripper" if self.gripper == G_CLOSE else "✊ Close Gripper"
+        btn_t  = ("Close Gripper (G)" if self.gripper == G_OPEN
+                  else "Open Gripper (G)")
         self.grip_lbl.config(text=label, foreground=colour)
         self.grip_btn.config(text=btn_t)
-        if self.robot is not None:
-            with self._angle_lock:
-                cmd = {j: int(round(self.angles[j])) for j in JOINTS}
-            cmd['g'] = self.gripper
-            threading.Thread(target=self.robot._stream_command,
-                             args=(cmd,), daemon=True).start()
 
-    def _go_home(self):
-        if self.robot is None:
+        cmd = {j: int(round(self.target_angles[j])) for j in JOINTS}
+        cmd['g'] = self.gripper
+
+        def send():
+            try:
+                self.robot._stream_command(cmd)
+                self.update_info(f"Gripper {label.lower()}")
+            except Exception as e:
+                self.update_info(f"Error: {e}")
+
+        threading.Thread(target=send, daemon=True).start()
+
+    def go_home(self):
+        """Mirrors gui_controller.go_home."""
+        if not self.connected:
             return
-        def do():
-            self._log("Going home…")
-            self.robot.home_position(smooth=True, display_progress=False)
-            with self._angle_lock:
+
+        def move_home():
+            try:
+                self.update_info("Moving to home position...")
+                self.robot.home_position(smooth=True, display_progress=False)
+
                 for j in JOINTS:
-                    self.angles[j] = HOME[j]
+                    self.target_angles[j] = HOME[j]
                 self.gripper = HOME['g']
-            self._log("✓ Home reached.")
-        threading.Thread(target=do, daemon=True).start()
+                # Update sliders to home position (mirrors gui_controller)
+                self.root.after(0, lambda: self._update_joint_display(
+                    {j: HOME[j] for j in JOINTS}))
+                self.update_info("Home position reached")
+                self._log("Home reached.")
+            except Exception as e:
+                self.update_info(f"Error: {e}")
 
-    # ═════════════════════════════════════════════════════ display update ══════
-    def _update_display(self, angles, pkts):
-        with self._joy_lock:
-            axes = dict(self._joy)
-            stale = (time.monotonic() - self._last_joy_t) > JOY_TIMEOUT
+        threading.Thread(target=move_home, daemon=True).start()
 
-        for ax in AXES:
-            v = 0.0 if stale else axes[ax]
-            # Map -1..+1 → 0..200 for progress bar (100 = centre)
-            self._axis_bars[ax]['value'] = int((v + 1.0) * 100)
-            self._axis_vals[ax].config(text=f"{v:+.3f}")
-
+    # ═════════════════════════════════════════════════════════ display helpers ═
+    def _update_joint_display(self, angles):
         for j in JOINTS:
-            a = int(round(angles.get(j, self.angles.get(j, 0))))
-            self._joint_bars[j]['value'] = a
-            self._joint_lbls[j].config(text=f"{a:3d}°")
+            a = int(round(angles.get(j, self.target_angles.get(j, 0))))
+            self.angle_bars[j]['value'] = a
+            self.angle_labels[j].config(text=f"{a:3d}°")
 
-        self.pkt_lbl.config(text=f"pkts: {pkts}")
-
+    def _update_axis_display(self, axes, pkts, stale):
+        for ax in AXES:
+            v = axes.get(ax, 0.0)
+            # −1..+1  →  0..200  (100 = centre)
+            self.axis_bars[ax]['value'] = int((v + 1.0) * 100)
+            self.axis_vals[ax].config(text=f"{v:+.3f}")
+        self.pkt_label.config(text=f"pkts: {pkts}")
         if stale and pkts > 0:
-            self.udp_lbl.config(text="🟡 Joystick silent…", foreground='orange')
+            self.udp_label.config(text="  |  Joystick silent…",
+                                  foreground='orange')
         elif pkts > 0:
-            self.udp_lbl.config(text=f"🟢 Receiving  :{UDP_PORT}", foreground='green')
+            self.udp_label.config(text=f"  |  UDP :{UDP_PORT} receiving",
+                                  foreground='green')
 
     def _update_speed_label(self):
         self.spd_lbl.config(text=f"{self.speed_var.get():.0f} °/s")
 
-    # ═══════════════════════════════════════════════════════════════ helpers ═══
+    def update_info(self, message):
+        """Update status bar — mirrors gui_controller.update_info."""
+        self.root.after(0, lambda: self.info_label.config(text=message))
+
     def _log(self, msg):
         def _do():
-            self.log.configure(state='normal')
-            self.log.insert(tk.END, msg + "\n")
-            self.log.see(tk.END)
-            self.log.configure(state='disabled')
+            self.log_box.configure(state='normal')
+            self.log_box.insert(tk.END, msg + "\n")
+            self.log_box.see(tk.END)
+            self.log_box.configure(state='disabled')
         self.root.after(0, _do)
 
+    # ══════════════════════════════════════════════════════════════ on_closing ═
     def on_closing(self):
-        self._udp_running     = False
+        """Mirrors gui_controller.on_closing."""
         self._control_running = False
-        if self.robot:
-            try:
-                self.robot.disconnect()
-            except Exception:
-                pass
+        if self.connected:
+            self.disconnect()
         self.root.destroy()
 
 
