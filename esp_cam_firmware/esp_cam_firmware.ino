@@ -21,14 +21,20 @@
 
 #define LED_GPIO_NUM       4   // Onboard white flash LED (active HIGH)
 
-// WiFi credentials - YOUR NETWORK
-const char* ssid = "PrimeRobotics";
-const char* password = "primerobotics123";
+// WiFi credentials — tried in order, falls back to AP mode if none connect
+struct WifiNet {
+  const char* ssid;
+  const char* password;
+  IPAddress   ip;
+  IPAddress   gateway;
+};
+const WifiNet networks[] = {
+  { "PrimeRobotics",       "primerobotics123", IPAddress(192,168, 18,110), IPAddress(192,168, 18,1) },
+  { "Airtel 4G MiFi_80C1", "55105322Gh$",     IPAddress(192,168,  0,110), IPAddress(192,168,  0,1) },
+};
 
-// Static IP configuration
-IPAddress staticIP(192, 168, 18, 110);   // desired static IP
-IPAddress gateway(192, 168, 18,   1);    // your router IP
-IPAddress subnet(255, 255, 255,   0);
+// Shared subnet / DNS for all networks
+IPAddress subnet(255, 255, 255, 0);
 IPAddress dns(8, 8, 8, 8);
 
 WiFiServer server(80);
@@ -71,23 +77,24 @@ void setup() {
     return;
   }
 
-  // Connect to WiFi
-  WiFi.config(staticIP, gateway, subnet, dns);
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi...");
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
+  // Try each network in order
+  bool connected = false;
+  for (int n = 0; n < 2 && !connected; n++) {
+    Serial.printf("\nTrying network: %s ...", networks[n].ssid);
+    WiFi.disconnect(true);
+    WiFi.config(networks[n].ip, networks[n].gateway, subnet, dns);
+    WiFi.begin(networks[n].ssid, networks[n].password);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    connected = (WiFi.status() == WL_CONNECTED);
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\nFailed to connect to WiFi!");
-    Serial.println("Please check your credentials");
-    Serial.println("Creating access point instead...");
-    
+  if (!connected) {
+    Serial.println("\nAll networks failed — creating access point...");
     // Fallback to AP mode
     WiFi.softAP("ESP32-CAM", "12345678");
     Serial.print("AP IP address: ");
