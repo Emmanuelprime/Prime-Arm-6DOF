@@ -38,7 +38,7 @@ JOINT_NAMES = {'b': 'Base', 's': 'Shoulder', 'e': 'Elbow',
 LIMITS      = {'b': (0, 180), 's': (0, 180), 'e': (0, 180),
                'w': (0, 180), 't': (0, 180)}
 HOME        = {'b': 90, 's': 130, 'e': 180, 'w': 180, 't': 180, 'g': 80}
-G_OPEN      = 30
+G_OPEN      = 60
 G_CLOSE     = 80
 
 AXES        = ('rx', 'ry', 'lx', 'ly')
@@ -474,21 +474,26 @@ class JoystickController:
         cmd = {j: int(round(self.target_angles[j])) for j in JOINTS}
         cmd['g'] = self.gripper
 
+        self.sending_command = True
+
         def send():
             try:
                 self.robot._stream_command(cmd)
                 self.update_info(f"Gripper {label.lower()}")
             except Exception as e:
                 self.update_info(f"Error: {e}")
+            finally:
+                self.sending_command = False
 
         threading.Thread(target=send, daemon=True).start()
 
     def go_home(self):
         """Mirrors gui_controller.go_home."""
-        if not self.connected:
+        if not self.connected or self.sending_command:
             return
 
         def move_home():
+            self.sending_command = True
             try:
                 self.update_info("Moving to home position...")
                 self.robot.home_position(smooth=True, display_progress=False)
@@ -503,6 +508,8 @@ class JoystickController:
                 self._log("Home reached.")
             except Exception as e:
                 self.update_info(f"Error: {e}")
+            finally:
+                self.sending_command = False
 
         threading.Thread(target=move_home, daemon=True).start()
 
