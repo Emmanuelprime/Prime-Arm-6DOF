@@ -220,10 +220,24 @@ class JoystickController:
         self.spd_lbl.pack()
         self._update_speed_label()
 
+        # End-effector position (mirrors gui_controller pos_frame)
+        pos_frame = ttk.LabelFrame(right, text="End Effector Position (cm)",
+                                   padding="10")
+        pos_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        self.x_label = ttk.Label(pos_frame, text="X: ---",
+                                 font=('Arial', 11, 'bold'), width=12)
+        self.x_label.grid(row=0, column=0, padx=6)
+        self.y_label = ttk.Label(pos_frame, text="Y: ---",
+                                 font=('Arial', 11, 'bold'), width=12)
+        self.y_label.grid(row=0, column=1, padx=6)
+        self.z_label = ttk.Label(pos_frame, text="Z: ---",
+                                 font=('Arial', 11, 'bold'), width=12)
+        self.z_label.grid(row=0, column=2, padx=6)
+
         # Axis → joint mapping
         map_frame = ttk.LabelFrame(right, text="Axis → Joint Mapping",
                                    padding="10")
-        map_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        map_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         map_frame.columnconfigure(1, weight=1)
 
         joint_opts = list(JOINTS) + ['—']
@@ -244,9 +258,8 @@ class JoystickController:
 
         # Log
         log_frame = ttk.LabelFrame(right, text="Log", padding=4)
-        log_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
+        log_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        right.rowconfigure(3, weight=1)
         self.log_box = scrolledtext.ScrolledText(log_frame, height=10,
                                                  font=('Consolas', 8),
                                                  state='disabled', wrap=tk.WORD)
@@ -448,6 +461,12 @@ class JoystickController:
             finally:
                 self.sending_command = False
             self.root.after(0, lambda: self._update_joint_display(a))
+            # Compute FK from target angles (no serial needed) and update XYZ
+            try:
+                x, y, z = self.robot.calculate_fk(a)
+                self.root.after(0, lambda: self._update_position_display(x, y, z))
+            except Exception:
+                pass
 
         threading.Thread(target=send, daemon=True).start()
 
@@ -489,6 +508,11 @@ class JoystickController:
         self._log("Going home.")
 
     # ═════════════════════════════════════════════════════════ display helpers ═
+    def _update_position_display(self, x, y, z):
+        self.x_label.config(text=f"X: {x:6.2f}")
+        self.y_label.config(text=f"Y: {y:6.2f}")
+        self.z_label.config(text=f"Z: {z:6.2f}")
+
     def _update_joint_display(self, angles):
         for j in JOINTS:
             a = int(round(angles.get(j, self.target_angles.get(j, 0))))
