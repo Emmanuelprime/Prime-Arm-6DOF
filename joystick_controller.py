@@ -82,6 +82,7 @@ class JoystickController:
 
         # Control loop flag
         self._control_running = False
+        self._homing = False
 
         self.create_widgets()
         self._start_udp_listener()
@@ -393,21 +394,40 @@ class JoystickController:
         if not self.connected or self.sending_command:
             return
 
-        speed   = self.speed_var.get()
-        changed = False
+        speed      = self.speed_var.get()
+        max_step   = speed * DT
+        changed    = False
         new_angles = dict(self.target_angles)
 
-        for ax in AXES:
-            joint = self._map_joint[ax].get()
-            if joint == '—' or joint not in LIMITS:
-                continue
-            sign  = self._map_sign[ax].get()
-            delta = axes[ax] * sign * speed * DT
-            if abs(delta) < 0.01:
-                continue
-            lo, hi = LIMITS[joint]
-            new_angles[joint] = max(lo, min(hi, new_angles[joint] + delta))
-            changed = True
+        if self._homing:
+            # Drive every joint toward HOME at current speed
+            all_home = True
+            for j in JOINTS:
+                diff = HOME[j] - new_angles[j]
+                if abs(diff) > 0.5:
+                    step = max_step if diff > 0 else -max_step
+                    if abs(diff) < abs(step):
+                        step = diff
+                    new_angles[j] += step
+                    all_home = False
+            if all_home:
+                self._homing = False
+                self.root.after(0, lambda: self.update_info("Home position reached"))
+                self.root.after(0, lambda: self._log("Home reached."))
+            changed = not all_home
+        else:
+            # Normal joystick rate control
+            for ax in AXES:
+                joint = self._map_joint[ax].get()
+                if joint == '—' or joint not in LIMITS:
+                    continue
+                sign  = self._map_sign[ax].get()
+                delta = axes[ax] * sign * speed * DT
+                if abs(delta) < 0.01:
+                    continue
+                lo, hi = LIMITS[joint]
+                new_angles[joint] = max(lo, min(hi, new_angles[joint] + delta))
+                changed = True
 
         if not changed:
             return
@@ -461,11 +481,10 @@ class JoystickController:
         threading.Thread(target=send, daemon=True).start()
 
     def go_home(self):
-        """Set target_angles to HOME and let the control loop drive the arm there smoothly."""
+        """Activate homing — _tick drives every joint to HOME at current speed."""
         if not self.connected:
             return
-        for j in JOINTS:
-            self.target_angles[j] = float(HOME[j])
+        self._homing = True
         self.update_info("Going home...")
         self._log("Going home.")
 
